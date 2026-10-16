@@ -1,6 +1,7 @@
 import imaplib
 import smtplib
 import time
+import os
 import email
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -132,6 +133,17 @@ def parse_email_message(msg_bytes: bytes, e_id: str) -> dict:
                     clean_filename = f"attachment_{part.get_content_type().replace('/', '_')}"
                 if clean_filename not in attachments:
                     attachments.append(clean_filename)
+                
+                # Save attachment payload to disk
+                payload = part.get_payload(decode=True)
+                if payload:
+                    try:
+                        att_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "email_attachments", str(e_id))
+                        os.makedirs(att_dir, exist_ok=True)
+                        with open(os.path.join(att_dir, clean_filename), "wb") as f_att:
+                            f_att.write(payload)
+                    except Exception as e_save:
+                        logger.warning(f"Could not save attachment {clean_filename}: {e_save}")
                 continue
                 
             payload = part.get_payload(decode=True)
@@ -268,7 +280,7 @@ def get_unread_count(dry_run: bool = False) -> int:
         logger.error(f"Failed to check unread count: {e}")
         return 0
 
-def send_email(to_address: str, subject: str, body: str) -> bool:
+def send_email(to_address: str, subject: str, body: str, attachments: list = None) -> bool:
     if not config.GMAIL_USER or not config.GMAIL_APP_PASSWORD:
         err_msg = "Gmail credentials missing; cannot send email."
         logger.error(err_msg)
@@ -282,11 +294,44 @@ def send_email(to_address: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
+        # Attach documents & images if specified
+        if attachments:
+            import mimetypes
+            from email.mime.base import MIMEBase
+            from email import encoders
+            
+            for att in attachments:
+                file_path = att if isinstance(att, str) else att.get("path")
+                file_name = os.path.basename(file_path) if isinstance(att, str) else att.get("filename", os.path.basename(file_path))
+                
+                if not file_path or not os.path.exists(file_path):
+                    logger.warning(f"Attachment file not found: {file_path}")
+                    continue
+                    
+                ctype, encoding = mimetypes.guess_type(file_path)
+                if ctype is None or encoding is not None:
+                    ctype = "application/octet-stream"
+                maintype, subtype = ctype.split("/", 1)
+                
+                try:
+                    with open(file_path, "rb") as fp:
+                        part = MIMEBase(maintype, subtype)
+                        part.set_payload(fp.read())
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        "Content-Disposition",
+                        f"attachment; filename=\"{file_name}\""
+                    )
+                    msg.attach(part)
+                    logger.info(f"Attached file '{file_name}' to email to {to_address}")
+                except Exception as ex_att:
+                    logger.error(f"Failed to attach file {file_path}: {ex_att}")
+
         server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
         server.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
         server.send_message(msg)
         server.quit()
-        logger.info(f"Email successfully sent to {to_address}")
+        logger.info(f"Email successfully sent to {to_address} with {len(attachments or [])} attachment(s)")
         return True
 
     # Retry SMTP once with backoff on transient error

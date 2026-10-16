@@ -7,3 +7,4 @@ python-dotenv==1.2.4
 requests==2.34.2
 rich==15.0.0
 pytest==9.1.1
+pypdf==6.21.0

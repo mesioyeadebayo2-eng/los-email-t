@@ -20,6 +20,7 @@ from telegram_client import (
     download_telegram_file
 )
 import voice_engine
+import attachment_handler
 from scheduler import create_scheduler
 
 logger = logging.getLogger(__name__)
@@ -102,9 +103,11 @@ def handle_telegram_callback(cb: dict):
             to_addr = send_data["to_address"]
             subj = send_data["subject"]
             body = send_data["body"]
+            attachments = send_data.get("attachments", [])
             
-            send_telegram_message(chat_id, f"✉️ <b>Sending email to {to_addr}...</b>")
-            success = send_email(to_addr, subj, body)
+            att_desc = f" with {len(attachments)} attachment(s)" if attachments else ""
+            send_telegram_message(chat_id, f"✉️ <b>Sending email to {to_addr}{att_desc}...</b>")
+            success = send_email(to_addr, subj, body, attachments=attachments)
             if success:
                 send_telegram_message(chat_id, f"✅ Email sent successfully to <b>{to_addr}</b>!")
             else:
@@ -175,7 +178,83 @@ def handle_telegram_incoming_message(msg: dict):
             handle_telegram_intent(transcribed_text, chat_id, voice_reply=True)
             return jsonify({"status": "ok"}), 200
 
-    # 2. Text message handling
+    # 2. Photo / Image handling (Multimodal Vision or Email attachment)
+    if "photo" in msg:
+        photos = msg.get("photo", [])
+        if photos:
+            best_photo = photos[-1]
+            file_id = best_photo.get("file_id")
+            caption = (msg.get("caption") or "").strip()
+            logger.info(f"Received Telegram photo from chat {chat_id} (file_id: {file_id[:16]}...)")
+            send_chat_action(chat_id, "typing")
+            
+            img_bytes = download_telegram_file(file_id)
+            if not img_bytes:
+                send_telegram_message(chat_id, "⚠️ Could not download the photo. Please try again.")
+                return jsonify({"status": "ok"}), 200
+                
+            local_path = attachment_handler.save_upload(img_bytes, f"photo_{file_id[:8]}.jpg")
+            
+            # Check if user instructed to email this photo
+            if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
+                intent_data = parse_user_command(caption)
+                to_email = intent_data.get("to_email")
+                subject = intent_data.get("subject") or "Photo Attached"
+                body = intent_data.get("body") or "Please find the attached photo."
+                if to_email and "@" in to_email:
+                    confirmation_id = db.create_pending_send(to_email, subject, body, attachments=[local_path])
+                    send_send_confirmation(chat_id, confirmation_id, to_email, subject, body, attachments=[local_path])
+                    return jsonify({"status": "ok"}), 200
+
+            # Otherwise analyze the image with GPT-4o-mini Vision
+            send_telegram_message(chat_id, "🔍 <i>Analyzing image with Cedar Vision...</i>")
+            analysis = attachment_handler.analyze_image(img_bytes, user_prompt=caption)
+            send_reply(chat_id, f"🖼️ <b>Image Analysis:</b>\n\n{html.escape(analysis)}", voice_reply=("voice" in caption.lower()))
+            return jsonify({"status": "ok"}), 200
+
+    # 3. Document handling (PDF, CSV, TXT, images sent as files)
+    if "document" in msg:
+        doc = msg.get("document", {})
+        file_id = doc.get("file_id")
+        file_name = doc.get("file_name", "document.pdf")
+        mime_type = doc.get("mime_type", "")
+        caption = (msg.get("caption") or "").strip()
+        logger.info(f"Received Telegram document '{file_name}' from chat {chat_id}")
+        send_chat_action(chat_id, "typing")
+        
+        doc_bytes = download_telegram_file(file_id)
+        if not doc_bytes:
+            send_telegram_message(chat_id, "⚠️ Could not download the document. Please try again.")
+            return jsonify({"status": "ok"}), 200
+            
+        local_path = attachment_handler.save_upload(doc_bytes, file_name)
+        
+        # Check if user wants to email this document
+        if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
+            intent_data = parse_user_command(caption)
+            to_email = intent_data.get("to_email")
+            subject = intent_data.get("subject") or f"Document: {file_name}"
+            body = intent_data.get("body") or f"Please find attached {file_name}."
+            if to_email and "@" in to_email:
+                confirmation_id = db.create_pending_send(to_email, subject, body, attachments=[local_path])
+                send_send_confirmation(chat_id, confirmation_id, to_email, subject, body, attachments=[local_path])
+                return jsonify({"status": "ok"}), 200
+
+        # If document is an image (sent as file)
+        if mime_type.startswith("image/"):
+            send_telegram_message(chat_id, "🔍 <i>Analyzing image with Cedar Vision...</i>")
+            analysis = attachment_handler.analyze_image(doc_bytes, user_prompt=caption)
+            send_reply(chat_id, f"🖼️ <b>Image Analysis:</b>\n\n{html.escape(analysis)}", voice_reply=("voice" in caption.lower()))
+            return jsonify({"status": "ok"}), 200
+            
+        # If document is PDF or text
+        send_telegram_message(chat_id, f"📄 <i>Reading document '{html.escape(file_name)}'...</i>")
+        doc_text = attachment_handler.extract_document_text(doc_bytes, file_name)
+        summary = attachment_handler.summarize_document(doc_text, file_name, user_instruction=caption)
+        send_reply(chat_id, f"📄 <b>Document Insights ({html.escape(file_name)}):</b>\n\n{html.escape(summary)}", voice_reply=("voice" in caption.lower()))
+        return jsonify({"status": "ok"}), 200
+
+    # 4. Text message handling
     text_body = msg.get("text", "").strip()
     if not text_body:
         return jsonify({"status": "ok"}), 200

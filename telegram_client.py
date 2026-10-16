@@ -74,7 +74,7 @@ def answer_callback_query(callback_query_id: str, text: str = None) -> bool:
         logger.error(f"Error answering callback query: {e}")
         return False
 
-def send_send_confirmation(chat_id: str, confirmation_id: str, to_address: str, subject: str, body: str) -> bool:
+def send_send_confirmation(chat_id: str, confirmation_id: str, to_address: str, subject: str, body: str, attachments: list = None) -> bool:
     """
     Send an email preview with inline confirmation keyboard:
     [✅ Confirm] [✏️ Edit] [❌ Cancel]
@@ -83,10 +83,18 @@ def send_send_confirmation(chat_id: str, confirmation_id: str, to_address: str, 
     safe_subject = html.escape(str(subject), quote=False)
     safe_body = html.escape(str(body), quote=False)
     
+    att_block = ""
+    if attachments:
+        import os
+        att_names = [os.path.basename(a) if isinstance(a, str) else a.get("filename", "file") for a in attachments]
+        safe_atts = html.escape(", ".join(att_names), quote=False)
+        att_block = f"<b>📎 Attachments:</b> <code>{safe_atts}</code>\n\n"
+
     message_body = (
         f"✉️ <b>Outgoing Email Preview</b>\n\n"
         f"<b>To:</b> <code>{safe_to}</code>\n"
         f"<b>Subject:</b> {safe_subject}\n\n"
+        f"{att_block}"
         f"<b>Body:</b>\n{safe_body}\n\n"
         f"<i>Please review and confirm sending:</i>"
     )

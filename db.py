@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import uuid
+import json
 from datetime import datetime
 from contextlib import contextmanager
 import logging
@@ -99,10 +100,18 @@ def init_db(db_path=None):
                 to_address TEXT NOT NULL,
                 subject TEXT,
                 body TEXT,
+                attachments TEXT,
                 status TEXT CHECK(status IN ('pending', 'sent', 'cancelled')),
                 created_at TEXT
             )
         """)
+
+        # Migration: add attachments column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE pending_sends ADD COLUMN attachments TEXT")
+            conn.commit()
+        except Exception:
+            pass
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_memory (
@@ -309,18 +318,19 @@ def list_sender_policies(db_path=None) -> list[dict]:
         rows = cursor.fetchall()
         return [{"email": row["email"], "auto_action": row["auto_action"]} for row in rows]
 
-def create_pending_send(to_address: str, subject: str, body: str, db_path=None) -> str:
+def create_pending_send(to_address: str, subject: str, body: str, attachments: list = None, db_path=None) -> str:
     send_id = uuid.uuid4().hex[:12]
     pg = is_postgres(db_path)
+    att_json = json.dumps(attachments or [])
     with get_db_connection(db_path) as conn:
         cursor = _get_cursor(conn, pg)
         _exec(
             cursor,
             """
-            INSERT INTO pending_sends (id, to_address, subject, body, status, created_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
+            INSERT INTO pending_sends (id, to_address, subject, body, attachments, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
             """,
-            (send_id, to_address, subject, body, datetime.now().isoformat()),
+            (send_id, to_address, subject, body, att_json, datetime.now().isoformat()),
             is_pg=pg
         )
         conn.commit()
@@ -332,17 +342,23 @@ def get_pending_send(send_id: str, db_path=None) -> dict | None:
         cursor = _get_cursor(conn, pg)
         _exec(
             cursor,
-            "SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?",
+            "SELECT id, to_address, subject, body, attachments, status, created_at FROM pending_sends WHERE id = ?",
             (send_id,),
             is_pg=pg
         )
         row = cursor.fetchone()
         if row:
+            raw_att = row["attachments"] if "attachments" in row.keys() else "[]"
+            try:
+                parsed_att = json.loads(raw_att) if raw_att else []
+            except Exception:
+                parsed_att = []
             return {
                 "id": row["id"],
                 "to_address": row["to_address"],
                 "subject": row["subject"],
                 "body": row["body"],
+                "attachments": parsed_att,
                 "status": row["status"],
                 "created_at": str(row["created_at"])
             }
@@ -359,7 +375,7 @@ def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]
         cursor = _get_cursor(conn, pg)
         _exec(
             cursor,
-            "SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?",
+            "SELECT id, to_address, subject, body, attachments, status, created_at FROM pending_sends WHERE id = ?",
             (send_id,),
             is_pg=pg
         )
@@ -367,11 +383,18 @@ def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]
         if not row:
             return False, None
         
+        raw_att = row["attachments"] if "attachments" in row.keys() else "[]"
+        try:
+            parsed_att = json.loads(raw_att) if raw_att else []
+        except Exception:
+            parsed_att = []
+
         send_data = {
             "id": row["id"],
             "to_address": row["to_address"],
             "subject": row["subject"],
             "body": row["body"],
+            "attachments": parsed_att,
             "status": row["status"],
             "created_at": str(row["created_at"])
         }
