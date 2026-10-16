@@ -27,7 +27,9 @@ def init_background_scheduler():
     global scheduler
     if os.getenv("TESTING") == "1":
         return
-    if os.getenv("ENABLE_SCHEDULER", "true").lower() == "true":
+    # On Render or multi-service deployments, the dedicated background worker runs the scheduler.
+    default_enable = "false" if os.getenv("RENDER") else "true"
+    if os.getenv("ENABLE_SCHEDULER", default_enable).lower() == "true":
         if scheduler is None:
             try:
                 scheduler = create_scheduler(dry_run=False, mark_read=False, standalone=False)

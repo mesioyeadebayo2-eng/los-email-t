@@ -10,27 +10,58 @@ import logger_util
 
 logger = logging.getLogger(__name__)
 
+def is_postgres(db_path=None) -> bool:
+    target = db_path if db_path else config.DATABASE_URL
+    return bool(target and ("postgres://" in target or "postgresql://" in target))
+
 def get_db_path(custom_path=None):
     return custom_path or config.DB_PATH
 
 @contextmanager
 def get_db_connection(db_path=None):
-    path = get_db_path(db_path)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+    if is_postgres(db_path):
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        url = db_path if (db_path and ("postgres://" in db_path or "postgresql://" in db_path)) else config.DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        path = get_db_path(db_path)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        conn = sqlite3.connect(path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+def _get_cursor(conn, is_pg: bool):
+    if is_pg:
+        import psycopg2.extras
+        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    return conn.cursor()
+
+def _exec(cursor, query: str, params: tuple = (), is_pg: bool = False):
+    if is_pg:
+        # Translate SQLite ? placeholders to Postgres %s placeholders
+        pg_query = query.replace("?", "%s")
+        cursor.execute(pg_query, params)
+    else:
+        cursor.execute(query, params)
 
 def init_db(db_path=None):
-    path = get_db_path(db_path)
-    with get_db_connection(path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    pg = is_postgres(db_path)
+    pk_type = "SERIAL PRIMARY KEY" if pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS processed_emails (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 account TEXT NOT NULL,
                 message_uid TEXT NOT NULL,
                 folder TEXT NOT NULL,
@@ -42,9 +73,9 @@ def init_db(db_path=None):
             )
         """)
         
-        cursor.execute("""
+        cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS drafts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 email_uid TEXT NOT NULL,
                 sender TEXT,
                 subject TEXT,
@@ -73,37 +104,43 @@ def init_db(db_path=None):
             )
         """)
         
-        # Indexes for fast lookups
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_lookup ON processed_emails(account, folder, message_uid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_uid ON drafts(email_uid)")
         conn.commit()
-    logger.info(f"Database initialized at {path}")
+    target_desc = "PostgreSQL (DATABASE_URL)" if pg else get_db_path(db_path)
+    logger.info(f"Database initialized on {target_desc}")
 
 def reset_db(db_path=None):
-    path = get_db_path(db_path)
-    with get_db_connection(path) as conn:
-        cursor = conn.cursor()
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
         cursor.execute("DROP TABLE IF EXISTS processed_emails")
         cursor.execute("DROP TABLE IF EXISTS drafts")
         cursor.execute("DROP TABLE IF EXISTS sender_policy")
         cursor.execute("DROP TABLE IF EXISTS pending_sends")
         conn.commit()
-    init_db(path)
-    logger.info(f"Database reset at {path}")
+    init_db(db_path)
+    logger.info(f"Database reset on {'PostgreSQL' if pg else get_db_path(db_path)}")
 
 def is_email_processed(account: str, folder: str, message_uid: str, db_path=None) -> bool:
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
             "SELECT 1 FROM processed_emails WHERE account = ? AND folder = ? AND message_uid = ?",
-            (account or "", folder or "INBOX", str(message_uid))
+            (account or "", folder or "INBOX", str(message_uid)),
+            is_pg=pg
         )
         return cursor.fetchone() is not None
 
 def mark_email_processed(account: str, message_uid: str, folder: str, subject: str, sender: str, digest_date: str, status: str = "processed", db_path=None):
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             INSERT INTO processed_emails (account, message_uid, folder, subject, sender, digest_date, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(account, folder, message_uid) DO UPDATE SET
@@ -111,29 +148,44 @@ def mark_email_processed(account: str, message_uid: str, folder: str, subject: s
                 sender = excluded.sender,
                 digest_date = excluded.digest_date,
                 status = excluded.status
-        """, (account or "", str(message_uid), folder or "INBOX", subject or "", sender or "", digest_date or datetime.now().strftime("%Y-%m-%d"), status))
+            """,
+            (account or "", str(message_uid), folder or "INBOX", subject or "", sender or "", digest_date or datetime.now().strftime("%Y-%m-%d"), status),
+            is_pg=pg
+        )
         conn.commit()
 
 def save_draft_db(email_uid: str, sender: str, subject: str, draft_body: str, db_path=None):
     clean_uid = str(email_uid).lstrip("#").strip()
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             INSERT INTO drafts (email_uid, sender, subject, draft_body, created_at, reviewed, sent)
             VALUES (?, ?, ?, ?, ?, 0, 0)
-        """, (clean_uid, sender or "", subject or "", draft_body or "", datetime.now().isoformat()))
+            """,
+            (clean_uid, sender or "", subject or "", draft_body or "", datetime.now().isoformat()),
+            is_pg=pg
+        )
         conn.commit()
 
 def get_draft_by_uid(email_uid: str, db_path=None) -> dict | None:
     clean_uid = str(email_uid).lstrip("#").strip()
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             SELECT id, email_uid, sender, subject, draft_body, created_at, reviewed, sent
             FROM drafts
             WHERE email_uid = ?
             ORDER BY id DESC LIMIT 1
-        """, (clean_uid,))
+            """,
+            (clean_uid,),
+            is_pg=pg
+        )
         row = cursor.fetchone()
         if row:
             return {
@@ -142,7 +194,7 @@ def get_draft_by_uid(email_uid: str, db_path=None) -> dict | None:
                 "sender": row["sender"],
                 "subject": row["subject"],
                 "draft_body": row["draft_body"],
-                "created_at": row["created_at"],
+                "created_at": str(row["created_at"]),
                 "reviewed": bool(row["reviewed"]),
                 "sent": bool(row["sent"])
             }
@@ -150,24 +202,36 @@ def get_draft_by_uid(email_uid: str, db_path=None) -> dict | None:
 
 def mark_draft_sent(email_uid: str, db_path=None):
     clean_uid = str(email_uid).lstrip("#").strip()
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             UPDATE drafts
             SET sent = 1, reviewed = 1
             WHERE email_uid = ?
-        """, (clean_uid,))
+            """,
+            (clean_uid,),
+            is_pg=pg
+        )
         conn.commit()
 
 def get_recent_processed_emails(limit: int = 5, db_path=None) -> list[dict]:
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             SELECT id, account, message_uid, folder, subject, sender, digest_date, status
             FROM processed_emails
             ORDER BY id DESC
             LIMIT ?
-        """, (limit,))
+            """,
+            (limit,),
+            is_pg=pg
+        )
         rows = cursor.fetchall()
         return [
             {
@@ -178,7 +242,7 @@ def get_recent_processed_emails(limit: int = 5, db_path=None) -> list[dict]:
                 "folder": row["folder"],
                 "subject": row["subject"],
                 "sender": row["sender"],
-                "digest_date": row["digest_date"],
+                "digest_date": str(row["digest_date"]),
                 "status": row["status"]
             }
             for row in rows
@@ -188,9 +252,15 @@ def get_sender_policy(email: str, db_path=None) -> str:
     if not email:
         return "none"
     clean_email = email.strip().lower()
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT auto_action FROM sender_policy WHERE email = ?", (clean_email,))
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            "SELECT auto_action FROM sender_policy WHERE email = ?",
+            (clean_email,),
+            is_pg=pg
+        )
         row = cursor.fetchone()
         if row:
             return row["auto_action"]
@@ -200,37 +270,56 @@ def set_sender_policy(email: str, auto_action: str, db_path=None):
     if auto_action not in ('none', 'auto_archive', 'auto_reply_whitelist'):
         raise ValueError(f"Invalid auto_action: {auto_action}")
     clean_email = email.strip().lower()
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             INSERT INTO sender_policy (email, auto_action)
             VALUES (?, ?)
             ON CONFLICT(email) DO UPDATE SET auto_action = excluded.auto_action
-        """, (clean_email, auto_action))
+            """,
+            (clean_email, auto_action),
+            is_pg=pg
+        )
         conn.commit()
 
 def list_sender_policies(db_path=None) -> list[dict]:
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT email, auto_action FROM sender_policy ORDER BY email ASC")
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT email, auto_action FROM sender_policy ORDER BY email ASC", is_pg=pg)
         rows = cursor.fetchall()
         return [{"email": row["email"], "auto_action": row["auto_action"]} for row in rows]
 
 def create_pending_send(to_address: str, subject: str, body: str, db_path=None) -> str:
     send_id = uuid.uuid4().hex[:12]
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            """
             INSERT INTO pending_sends (id, to_address, subject, body, status, created_at)
             VALUES (?, ?, ?, ?, 'pending', ?)
-        """, (send_id, to_address, subject, body, datetime.now().isoformat()))
+            """,
+            (send_id, to_address, subject, body, datetime.now().isoformat()),
+            is_pg=pg
+        )
         conn.commit()
     return send_id
 
 def get_pending_send(send_id: str, db_path=None) -> dict | None:
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?", (send_id,))
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            "SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?",
+            (send_id,),
+            is_pg=pg
+        )
         row = cursor.fetchone()
         if row:
             return {
@@ -239,7 +328,7 @@ def get_pending_send(send_id: str, db_path=None) -> dict | None:
                 "subject": row["subject"],
                 "body": row["body"],
                 "status": row["status"],
-                "created_at": row["created_at"]
+                "created_at": str(row["created_at"])
             }
     return None
 
@@ -249,9 +338,15 @@ def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]
     Returns (True, send_data) on the first execution.
     Returns (False, None) if already sent, cancelled, or not found.
     """
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?", (send_id,))
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            "SELECT id, to_address, subject, body, status, created_at FROM pending_sends WHERE id = ?",
+            (send_id,),
+            is_pg=pg
+        )
         row = cursor.fetchone()
         if not row:
             return False, None
@@ -262,11 +357,15 @@ def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]
             "subject": row["subject"],
             "body": row["body"],
             "status": row["status"],
-            "created_at": row["created_at"]
+            "created_at": str(row["created_at"])
         }
         
-        # Atomically update only if status is pending
-        cursor.execute("UPDATE pending_sends SET status = 'sent' WHERE id = ? AND status = 'pending'", (send_id,))
+        _exec(
+            cursor,
+            "UPDATE pending_sends SET status = 'sent' WHERE id = ? AND status = 'pending'",
+            (send_id,),
+            is_pg=pg
+        )
         if cursor.rowcount == 1:
             conn.commit()
             return True, send_data
@@ -274,17 +373,24 @@ def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]
             return False, None
 
 def cancel_pending_send(send_id: str, db_path=None) -> bool:
+    pg = is_postgres(db_path)
     with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE pending_sends SET status = 'cancelled' WHERE id = ? AND status = 'pending'", (send_id,))
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            "UPDATE pending_sends SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+            (send_id,),
+            is_pg=pg
+        )
         updated = cursor.rowcount > 0
         conn.commit()
         return updated
 
 def check_db_health(db_path=None) -> bool:
     try:
+        pg = is_postgres(db_path)
         with get_db_connection(db_path) as conn:
-            cursor = conn.cursor()
+            cursor = _get_cursor(conn, pg)
             cursor.execute("SELECT 1")
             return cursor.fetchone() is not None
     except Exception as e:

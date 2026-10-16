@@ -47,9 +47,9 @@ python webhook.py
 ```
 
 ### Production WSGI Server (Gunicorn):
-In production, run the Flask application behind a production WSGI server like Gunicorn (with `debug=False` enforced):
+In production (or Render Web Service), run with 1 worker and multi-threading to prevent database locking while handling concurrent requests:
 ```bash
-gunicorn -w 4 -b 0.0.0.0:5000 webhook:app
+gunicorn -w 1 -k gthread --threads 8 --timeout 120 webhook:app
 ```
 
 ### Health Check Endpoint:
@@ -60,6 +60,23 @@ GET /healthz
 Response:
 ```json
 {"ok": true, "db": true}
+```
+
+---
+
+## ☁️ Deploying on Render (Blueprints)
+
+MailPilot includes a turnkey `render.yaml` blueprint that provisions:
+1. **Managed PostgreSQL Database (`mailpilot-db`)**: Provides persistent, zero-loss storage shared seamlessly between your Webhook service and Scheduler worker.
+2. **Web Service (`mailpilot-web`)**: Serves `/webhook` and `/healthz` via `gunicorn -w 1 -k gthread --threads 8`.
+3. **Background Worker (`mailpilot-scheduler`)**: Runs `python main.py --daemon` 24/7 for scheduled daily digests and hourly triage.
+
+### Setting the Telegram Webhook on Render:
+Once deployed, set your webhook using `curl` with your `WEBHOOK_SECRET_TOKEN`:
+```bash
+curl -F "url=https://<your-render-service>.onrender.com/webhook" \
+     -F "secret_token=<YOUR_WEBHOOK_SECRET_TOKEN>" \
+     https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/setWebhook
 ```
 
 ---

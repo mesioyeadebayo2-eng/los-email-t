@@ -25,11 +25,14 @@ TRIAGE_INTERVAL_MINUTES = int(os.getenv("TRIAGE_INTERVAL_MINUTES", "60"))
 # IMAP Fetch Limits
 MAX_FETCH = int(os.getenv("MAX_FETCH", "20"))
 
-# Deprecated
-NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
+# Database Configuration (Postgres support via DATABASE_URL or SQLite fallback)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Paths
+# Paths & Directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("MAILPILOT_DATA_DIR", os.path.join(BASE_DIR, "data"))
 DB_PATH = os.getenv("MAILPILOT_DB_PATH", os.path.join(DATA_DIR, "mailpilot.db"))
 LOG_PATH = os.getenv("MAILPILOT_LOG_PATH", os.path.join(DATA_DIR, "mailpilot.log"))
+
+# Deprecated
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")

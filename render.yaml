@@ -1,0 +1,73 @@
+# Render Blueprint: MailPilot
+# Deploys:
+#   1. Managed PostgreSQL Database (shared between Webhook and Worker)
+#   2. Web Service for Telegram Webhooks (gunicorn 1 worker, 8 threads)
+#   3. Background Worker for Scheduled Digests and Light Triage (APScheduler daemon)
+
+databases:
+  - name: mailpilot-db
+    plan: free
+    databaseName: mailpilot
+    user: mailpilot_user
+
+services:
+  # 1. Webhook Web Service
+  - type: web
+    name: mailpilot-web
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k gthread --threads 8 --timeout 120 webhook:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: ENABLE_SCHEDULER
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mailpilot-db
+          property: connectionString
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET_TOKEN
+        generateValue: true
+      - key: AUTO_ARCHIVE_FOLDER
+        value: MailPilot/Archived
+
+  # 2. Background Scheduler Worker
+  - type: worker
+    name: mailpilot-scheduler
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py --daemon
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mailpilot-db
+          property: connectionString
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DIGEST_HOUR
+        value: "8"
+      - key: TRIAGE_INTERVAL_MINUTES
+        value: "60"
+      - key: MAX_FETCH
+        value: "20"
+      - key: AUTO_ARCHIVE_FOLDER
+        value: MailPilot/Archived

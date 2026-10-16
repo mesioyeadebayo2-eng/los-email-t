@@ -105,24 +105,30 @@ def create_scheduler(dry_run: bool = False, mark_read: bool = False, standalone:
     scheduler_cls = BlockingScheduler if standalone else BackgroundScheduler
     scheduler = scheduler_cls()
 
-    # Daily digest job at DIGEST_HOUR:00
+    # Daily digest job at DIGEST_HOUR:00 (misfire-tolerant: coalesce=True, max_instances=1)
     scheduler.add_job(
         func=run_daily_digest,
         trigger=CronTrigger(hour=config.DIGEST_HOUR, minute=0),
         args=[dry_run, mark_read, True],
         id="daily_digest_job",
         name="MailPilot Daily Digest",
-        replace_existing=True
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600
     )
 
-    # Hourly light triage job every TRIAGE_INTERVAL_MINUTES
+    # Hourly light triage job every TRIAGE_INTERVAL_MINUTES (misfire-tolerant)
     scheduler.add_job(
         func=run_hourly_triage,
         trigger=IntervalTrigger(minutes=config.TRIAGE_INTERVAL_MINUTES),
         args=[dry_run, mark_read],
         id="hourly_triage_job",
         name="MailPilot Hourly Triage",
-        replace_existing=True
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300
     )
 
     return scheduler
