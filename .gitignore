@@ -1,0 +1,36 @@
+# Credentials and Secrets
+.env
+*.env
+*.pem
+*.key
+
+# Application runtime data & persistence
+data/
+data/*.db
+data/*.log
+
+# Saved draft text files
+drafts/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
