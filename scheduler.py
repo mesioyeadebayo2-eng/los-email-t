@@ -38,6 +38,27 @@ def run_daily_digest(dry_run: bool = False, mark_read: bool = False, send_telegr
             digest_text = format_telegram_digest(processed)
             send_telegram_message(config.TELEGRAM_CHAT_ID, digest_text)
             
+            # Proactive Cedar morning audio briefing
+            try:
+                import voice_engine
+                from telegram_client import send_telegram_voice
+                user_name = db.get_user_memory("user_name") or "there"
+                urgent_count = sum(1 for e in processed if e.get("urgency") == "URGENT")
+                spoken = f"Good morning {user_name}! Here is your daily Cedar briefing. "
+                if not processed:
+                    spoken += "You are all caught up with zero unread emails in your inbox."
+                else:
+                    spoken += f"You have {len(processed)} email{'s' if len(processed) != 1 else ''} in your morning digest. "
+                    if urgent_count > 0:
+                        spoken += f"Heads up: {urgent_count} urgent message requires your attention. "
+                    top_senders = [e.get('sender', '') for e in processed[:3]]
+                    spoken += f"Key messages are from: {', '.join(top_senders)}. Have a great day ahead!"
+                audio = voice_engine.generate_speech(spoken, voice="cedar")
+                if audio:
+                    send_telegram_voice(config.TELEGRAM_CHAT_ID, audio, caption="🎙️ Cedar Morning Voice Briefing")
+            except Exception as e_voice:
+                logger.warning(f"Failed generating scheduled voice briefing: {e_voice}")
+            
         logger.info("Daily digest job completed successfully.")
         return {"emails": processed, "policy_actions": policy_actions}
 

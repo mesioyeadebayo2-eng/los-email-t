@@ -136,3 +136,58 @@ def format_telegram_digest(emails: list) -> str:
         lines.append(block)
 
     return "\n\n".join(lines)
+
+def send_chat_action(chat_id: str, action: str = "typing") -> bool:
+    """Send chat action like 'typing', 'record_voice', or 'upload_voice'."""
+    if not config.TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendChatAction"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "action": action}, timeout=5)
+        return True
+    except Exception as e:
+        logger.debug(f"sendChatAction error: {e}")
+        return False
+
+def download_telegram_file(file_id: str) -> bytes:
+    """Download a file (e.g. voice note) from Telegram."""
+    if not config.TELEGRAM_BOT_TOKEN:
+        return b""
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getFile"
+    try:
+        res = requests.get(url, params={"file_id": file_id}, timeout=15)
+        res.raise_for_status()
+        file_path = res.json().get("result", {}).get("file_path")
+        if not file_path:
+            logger.error("No file_path returned by getFile.")
+            return b""
+        download_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_BOT_TOKEN}/{file_path}"
+        dl_res = requests.get(download_url, timeout=30)
+        dl_res.raise_for_status()
+        return dl_res.content
+    except Exception as e:
+        logger.error(f"Error downloading Telegram file {file_id}: {e}")
+        return b""
+
+def send_telegram_voice(chat_id: str, audio_bytes: bytes, caption: str = None) -> bool:
+    """Send a voice note audio bubble to Telegram with waveform."""
+    if not config.TELEGRAM_BOT_TOKEN or not audio_bytes:
+        return False
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendVoice"
+    files = {"voice": ("voice.mp3", audio_bytes, "audio/mpeg")}
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+
+    for attempt in range(2):
+        try:
+            res = requests.post(url, data=data, files=files, timeout=(15, 45))
+            res.raise_for_status()
+            return True
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            logger.error(f"Error sending Telegram voice note: {e}")
+            return False
+    return False

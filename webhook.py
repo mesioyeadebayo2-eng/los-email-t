@@ -7,15 +7,19 @@ from flask import Flask, request, jsonify
 import config
 import db
 import logger_util
-from gmail_client import get_unread_emails, send_email
+from gmail_client import get_unread_emails, send_email, get_unread_count
 from ai_engine import process_emails, save_drafts, parse_user_command
 from policy_engine import apply_policy_actions
 from telegram_client import (
     send_telegram_message,
     format_telegram_digest,
     send_send_confirmation,
-    answer_callback_query
+    answer_callback_query,
+    send_telegram_voice,
+    send_chat_action,
+    download_telegram_file
 )
+import voice_engine
 from scheduler import create_scheduler
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,16 @@ def handle_telegram_callback(cb: dict):
 
     return jsonify({"status": "ok"}), 200
 
+def send_reply(chat_id: str, text: str, voice_reply: bool = False, spoken_override: str = None):
+    """Deliver a text message, and optionally a spoken voice note in Cedar's voice."""
+    send_telegram_message(chat_id, text)
+    if voice_reply:
+        send_chat_action(chat_id, "record_voice")
+        to_speak = spoken_override or re.sub(r'<[^>]+>', '', text)
+        audio = voice_engine.generate_speech(to_speak, voice="cedar")
+        if audio:
+            send_telegram_voice(chat_id, audio)
+
 def handle_telegram_incoming_message(msg: dict):
     chat_id = str(msg.get("chat", {}).get("id", ""))
     
@@ -139,6 +153,29 @@ def handle_telegram_incoming_message(msg: dict):
         logger.warning(f"Unauthorized chat ID attempt from: {chat_id}")
         return jsonify({"status": "ignored"}), 200
 
+    # 1. Voice Note / Audio handling
+    voice_obj = msg.get("voice") or msg.get("audio")
+    if voice_obj:
+        file_id = voice_obj.get("file_id")
+        if file_id:
+            logger.info(f"Received Telegram voice note from chat {chat_id} (file_id: {file_id[:16]}...)")
+            send_chat_action(chat_id, "record_voice")
+            audio_bytes = download_telegram_file(file_id)
+            if not audio_bytes:
+                send_telegram_message(chat_id, "⚠️ Could not download voice note. Please try again.")
+                return jsonify({"status": "ok"}), 200
+            
+            transcribed_text = voice_engine.transcribe_audio(audio_bytes)
+            if not transcribed_text:
+                send_telegram_message(chat_id, "🎙️ I received your voice note, but could not transcribe speech. Could you please try again?")
+                return jsonify({"status": "ok"}), 200
+
+            logger.info(f"Voice note transcribed: '{transcribed_text}'")
+            send_telegram_message(chat_id, f"🎙️ <i>Voice input:</i> \"{html.escape(transcribed_text)}\"")
+            handle_telegram_intent(transcribed_text, chat_id, voice_reply=True)
+            return jsonify({"status": "ok"}), 200
+
+    # 2. Text message handling
     text_body = msg.get("text", "").strip()
     if not text_body:
         return jsonify({"status": "ok"}), 200
@@ -179,21 +216,69 @@ def handle_telegram_incoming_message(msg: dict):
                 send_telegram_message(chat_id, "📋 No custom sender policies configured.\nUse <code>/allow email@x.com</code> or <code>/block email@x.com</code>.")
             return jsonify({"status": "ok"}), 200
 
-    # Process conversational intent
-    handle_telegram_intent(text_body, chat_id)
+        elif command == "/notes":
+            notes = db.get_personal_notes(10)
+            if not notes:
+                send_telegram_message(chat_id, "📝 You don't have any notes saved yet. Tell me 'Note down...' to save one!")
+            else:
+                lines = ["📝 <b>Your Personal Notes & Reminders:</b>\n"]
+                for n in notes:
+                    lines.append(f"• <b>#{n['id']}</b>: {html.escape(n['content'])}")
+                send_telegram_message(chat_id, "\n".join(lines))
+            return jsonify({"status": "ok"}), 200
+
+        elif command == "/briefing":
+            send_telegram_message(chat_id, "🎙️ <i>Preparing your Cedar audio briefing...</i>")
+            handle_telegram_intent("give me my morning audio briefing", chat_id, voice_reply=True)
+            return jsonify({"status": "ok"}), 200
+
+    # Check if user specifically requested a voice reply in text
+    voice_requested = any(w in text_body.lower() for w in ["voice note", "in voice", "speak to me", "voice reply", "audio message", "say it"])
+    handle_telegram_intent(text_body, chat_id, voice_reply=voice_requested)
     return jsonify({"status": "ok"}), 200
 
-def handle_telegram_intent(cmd: str, chat_id: str):
-    send_telegram_message(chat_id, "🤖 <i>Thinking...</i>")
+def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
+    send_chat_action(chat_id, "record_voice" if voice_reply else "typing")
     
     intent_data = parse_user_command(cmd)
-    intent = intent_data.get("intent", "unknown")
+    intent = intent_data.get("intent", "conversational")
 
-    if intent == "digest":
+    if intent == "remember":
+        key = intent_data.get("key", "user_profile")
+        val = intent_data.get("value", "")
+        db.set_user_memory(key, val)
+        reply = intent_data.get("response", f"Got it! I have remembered that for you.")
+        send_reply(chat_id, reply, voice_reply)
+
+    elif intent == "take_note":
+        note_content = intent_data.get("note", cmd)
+        note_id = db.add_personal_note(note_content)
+        reply = intent_data.get("response", f"📝 Saved note #{note_id}: \"{note_content}\"")
+        send_reply(chat_id, reply, voice_reply)
+
+    elif intent == "get_notes":
+        notes = db.get_personal_notes(10)
+        if not notes:
+            send_reply(chat_id, "📝 You don't have any notes saved yet. Tell me 'Note down...' or send a voice note to add one!", voice_reply)
+        else:
+            lines = ["📝 <b>Your Saved Notes & Reminders:</b>\n"]
+            for n in notes:
+                lines.append(f"• <b>#{n['id']}</b>: {html.escape(n['content'])}")
+            spoken = "Here are your latest notes: " + "; ".join([n['content'] for n in notes[:3]])
+            send_reply(chat_id, "\n".join(lines), voice_reply, spoken_override=spoken)
+
+    elif intent == "unread_count":
+        count = get_unread_count(dry_run=False)
+        reply = f"📬 You currently have <b>{count}</b> unread email(s) in your inbox."
+        spoken = f"You currently have {count} unread emails in your inbox."
+        send_reply(chat_id, reply, voice_reply, spoken_override=spoken)
+
+    elif intent == "digest":
         send_telegram_message(chat_id, "⏳ Fetching and processing your unread emails...")
         emails = get_unread_emails(dry_run=False, mark_read=False, filter_processed=True)
         if not emails:
-            send_telegram_message(chat_id, "📬 <b>MailPilot Digest</b>\nNo new unread emails.")
+            msg = "📬 <b>MailPilot Digest</b>\nNo new unread emails."
+            send_reply(chat_id, msg, voice_reply, spoken_override="You're all caught up! There are no new unread emails in your inbox.")
             return
             
         processed = process_emails(emails, dry_run=False)
@@ -203,11 +288,23 @@ def handle_telegram_intent(cmd: str, chat_id: str):
         digest_text = format_telegram_digest(processed)
         send_telegram_message(chat_id, digest_text)
 
+        if voice_reply:
+            urgent_count = sum(1 for e in processed if e.get("urgency") == "URGENT")
+            user_name = db.get_user_memory("user_name") or "there"
+            spoken = f"Hello {user_name}! I have processed {len(processed)} email{'s' if len(processed) != 1 else ''} for your digest. "
+            if urgent_count > 0:
+                spoken += f"You have {urgent_count} urgent message that needs your attention. "
+            top_emails = [e.get('subject', 'Untitled') for e in processed[:3]]
+            spoken += "Top topics include: " + ", ".join(top_emails) + ". Check the cards above for full details."
+            audio = voice_engine.generate_speech(spoken, voice="cedar")
+            if audio:
+                send_telegram_voice(chat_id, audio)
+
     elif intent == "summarize":
         n = intent_data.get("count", 5)
         recent_emails = db.get_recent_processed_emails(limit=n)
         if not recent_emails:
-            send_telegram_message(chat_id, "No recent processed emails found in the database. Ask me for a digest first!")
+            send_reply(chat_id, "No recent processed emails found in the database. Ask me for a digest first!", voice_reply)
             return
         
         msg = f"<b>Summary of last {len(recent_emails)} processed email(s):</b>\n\n"
@@ -217,44 +314,48 @@ def handle_telegram_intent(cmd: str, chat_id: str):
             safe_sender = html.escape(str(e.get("sender", "")), quote=False)
             safe_status = html.escape(str(e.get("status", "")), quote=False)
             msg += f"• <b>[{safe_uid}] {safe_subj}</b>\n  <i>From:</i> {safe_sender}\n  <i>Status:</i> {safe_status}\n"
-        send_telegram_message(chat_id, msg)
+        spoken = f"Here is the summary of your last {len(recent_emails)} processed emails: " + "; ".join([e.get('subject', '') for e in recent_emails[:3]])
+        send_reply(chat_id, msg, voice_reply, spoken_override=spoken)
 
     elif intent == "get_draft":
-        # Extract UID (handles "#3", "3", etc.)
         raw_id = str(intent_data.get("email_id", "")).strip()
         e_id = raw_id.lstrip("#")
-        
-        # Look up directly in SQLite database across restarts
         draft = db.get_draft_by_uid(e_id)
         if draft and draft.get("draft_body"):
             safe_sender = html.escape(str(draft.get("sender", "")), quote=False)
             safe_subj = html.escape(str(draft.get("subject", "")), quote=False)
             safe_body = html.escape(str(draft.get("draft_body", "")), quote=False)
-            send_telegram_message(
-                chat_id,
+            msg = (
                 f"<b>Draft for [{e_id}] (To: {safe_sender}):</b>\n"
                 f"<b>Subject:</b> Re: {safe_subj}\n\n"
                 f"{safe_body}"
             )
+            spoken = f"Here is the draft for email {e_id} to {draft.get('sender', '')}. The reply reads: {draft.get('draft_body', '')}"
+            send_reply(chat_id, msg, voice_reply, spoken_override=spoken)
         else:
-            send_telegram_message(chat_id, f"No draft found in database for ID {raw_id}.")
-            
+            send_reply(chat_id, f"No draft found in database for ID {raw_id}.", voice_reply)
+
     elif intent == "send_email":
         to_email = intent_data.get("to_email")
         subject = intent_data.get("subject", "Update")
         body = intent_data.get("body", "")
         
         if not to_email or "@" not in to_email:
-            send_telegram_message(chat_id, "I need a valid email address to send that. Could you repeat the command with the email address?")
+            send_reply(chat_id, "I need a valid email address to send that. Could you repeat the command with the email address?", voice_reply)
             return
 
-        # Two-step flow: store pending send and reply with preview + inline buttons
         confirmation_id = db.create_pending_send(to_email, subject, body)
         send_send_confirmation(chat_id, confirmation_id, to_email, subject, body)
+        if voice_reply:
+            spoken = f"I've drafted your email to {to_email} with subject {subject}. Please review and tap confirm in Telegram to send it."
+            audio = voice_engine.generate_speech(spoken, voice="cedar")
+            if audio:
+                send_telegram_voice(chat_id, audio)
 
     else:
-        reply = intent_data.get("response", "I didn't quite catch that. You can ask for a digest, a summary of recent emails, or ask me to draft/send an email.")
-        send_telegram_message(chat_id, reply)
+        # Conversational / general query / personal assistant response
+        reply = intent_data.get("response", "I am Cedar, your personal executive assistant. How can I assist you today?")
+        send_reply(chat_id, reply, voice_reply)
 
 if __name__ == "__main__":
     # Running directly in development (production uses gunicorn)

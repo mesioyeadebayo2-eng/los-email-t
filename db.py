@@ -103,6 +103,22 @@ def init_db(db_path=None):
                 created_at TEXT
             )
         """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_memory (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS personal_notes (
+                id {pk_type},
+                content TEXT NOT NULL,
+                created_at TEXT
+            )
+        """)
         
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_lookup ON processed_emails(account, folder, message_uid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_uid ON drafts(email_uid)")
@@ -385,6 +401,74 @@ def cancel_pending_send(send_id: str, db_path=None) -> bool:
         updated = cursor.rowcount > 0
         conn.commit()
         return updated
+
+def set_user_memory(key: str, value: str, db_path=None):
+    pg = is_postgres(db_path)
+    now = datetime.now().isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute("""
+                INSERT INTO user_memory (key, value, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+            """, (key.lower(), value, now))
+        else:
+            cursor.execute("""
+                INSERT OR REPLACE INTO user_memory (key, value, updated_at)
+                VALUES (?, ?, ?)
+            """, (key.lower(), value, now))
+        conn.commit()
+
+def get_user_memory(key: str, db_path=None):
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT value FROM user_memory WHERE key = ?", (key.lower(),), is_pg=pg)
+        row = cursor.fetchone()
+        if row:
+            return row["value"] if isinstance(row, dict) or pg else row[0]
+        return None
+
+def get_all_user_memories(db_path=None) -> dict:
+    pg = is_postgres(db_path)
+    memories = {}
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT key, value FROM user_memory", (), is_pg=pg)
+        for row in cursor.fetchall():
+            k = row["key"] if isinstance(row, dict) or pg else row[0]
+            v = row["value"] if isinstance(row, dict) or pg else row[1]
+            memories[k] = v
+    return memories
+
+def add_personal_note(content: str, db_path=None) -> int:
+    pg = is_postgres(db_path)
+    now = datetime.now().isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute("INSERT INTO personal_notes (content, created_at) VALUES (%s, %s) RETURNING id", (content, now))
+            row = cursor.fetchone()
+            note_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute("INSERT INTO personal_notes (content, created_at) VALUES (?, ?)", (content, now))
+            note_id = cursor.lastrowid
+        conn.commit()
+        return note_id
+
+def get_personal_notes(limit: int = 10, db_path=None) -> list:
+    pg = is_postgres(db_path)
+    notes = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, content, created_at FROM personal_notes ORDER BY id DESC LIMIT ?", (limit,), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                notes.append({"id": row["id"], "content": row["content"], "created_at": row["created_at"]})
+            else:
+                notes.append({"id": row[0], "content": row[1], "created_at": row[2]})
+    return notes
 
 def check_db_health(db_path=None) -> bool:
     try:

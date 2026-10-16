@@ -8,12 +8,27 @@ import db
 import logger_util
 from webhook import app, handle_telegram_incoming_message, handle_telegram_callback
 
+import socket
+
 logger = logging.getLogger(__name__)
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
+_instance_socket = None
+
+def acquire_instance_lock(port=54321):
+    global _instance_socket
+    _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _instance_socket.bind(("127.0.0.1", port))
+        return True
+    except socket.error:
+        print("⚠️ Another instance of MailPilot Telegram Poller is already active. Exiting to avoid 409 Conflict.")
+        sys.exit(0)
+
 def run_polling():
+    acquire_instance_lock()
     if not config.TELEGRAM_BOT_TOKEN:
         print("❌ TELEGRAM_BOT_TOKEN missing in .env")
         return
@@ -50,7 +65,8 @@ def run_polling():
                         logger.info(f"Received callback_query: {u['callback_query'].get('data')}")
                         handle_telegram_callback(u["callback_query"])
                     elif "message" in u:
-                        logger.info(f"Received message from chat {u['message'].get('chat', {}).get('id')}: {u['message'].get('text')}")
+                        msg_desc = u["message"].get("text") or ("[Voice Note]" if "voice" in u["message"] else "[Media]")
+                        logger.info(f"Received message from chat {u['message'].get('chat', {}).get('id')}: {msg_desc}")
                         handle_telegram_incoming_message(u["message"])
                     
         except requests.exceptions.Timeout:

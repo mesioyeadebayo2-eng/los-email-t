@@ -250,6 +250,24 @@ def get_unread_emails(dry_run: bool = False, mark_read: bool = False, max_fetch:
                 send_telegram_alert(err_msg)
                 return []
 
+def get_unread_count(dry_run: bool = False) -> int:
+    """Lightweight check to get total count of unseen emails in Inbox."""
+    if dry_run:
+        return len(MOCK_EMAILS)
+    if not config.GMAIL_USER or not config.GMAIL_APP_PASSWORD:
+        return 0
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
+        mail.select("inbox", readonly=True)
+        status, messages = mail.search(None, "(UNSEEN)")
+        count = len(messages[0].split()) if status == "OK" and messages and messages[0] else 0
+        mail.logout()
+        return count
+    except Exception as e:
+        logger.error(f"Failed to check unread count: {e}")
+        return 0
+
 def send_email(to_address: str, subject: str, body: str) -> bool:
     if not config.GMAIL_USER or not config.GMAIL_APP_PASSWORD:
         err_msg = "Gmail credentials missing; cannot send email."
