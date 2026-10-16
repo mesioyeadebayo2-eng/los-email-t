@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import logging
 from flask import Flask, request, jsonify
 
@@ -211,7 +212,11 @@ def handle_telegram_intent(cmd: str, chat_id: str):
         
         msg = f"<b>Summary of last {len(recent_emails)} processed email(s):</b>\n\n"
         for e in recent_emails:
-            msg += f"• <b>[{e['message_uid']}] {e['subject']}</b>\n  <i>From:</i> {e['sender']}\n  <i>Status:</i> {e['status']}\n"
+            safe_uid = html.escape(str(e.get("message_uid", "")), quote=False)
+            safe_subj = html.escape(str(e.get("subject", "")), quote=False)
+            safe_sender = html.escape(str(e.get("sender", "")), quote=False)
+            safe_status = html.escape(str(e.get("status", "")), quote=False)
+            msg += f"• <b>[{safe_uid}] {safe_subj}</b>\n  <i>From:</i> {safe_sender}\n  <i>Status:</i> {safe_status}\n"
         send_telegram_message(chat_id, msg)
 
     elif intent == "get_draft":
@@ -222,11 +227,14 @@ def handle_telegram_intent(cmd: str, chat_id: str):
         # Look up directly in SQLite database across restarts
         draft = db.get_draft_by_uid(e_id)
         if draft and draft.get("draft_body"):
+            safe_sender = html.escape(str(draft.get("sender", "")), quote=False)
+            safe_subj = html.escape(str(draft.get("subject", "")), quote=False)
+            safe_body = html.escape(str(draft.get("draft_body", "")), quote=False)
             send_telegram_message(
                 chat_id,
-                f"<b>Draft for [{e_id}] (To: {draft.get('sender', '')}):</b>\n"
-                f"<b>Subject:</b> Re: {draft.get('subject', '')}\n\n"
-                f"{draft['draft_body']}"
+                f"<b>Draft for [{e_id}] (To: {safe_sender}):</b>\n"
+                f"<b>Subject:</b> Re: {safe_subj}\n\n"
+                f"{safe_body}"
             )
         else:
             send_telegram_message(chat_id, f"No draft found in database for ID {raw_id}.")

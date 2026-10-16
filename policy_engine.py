@@ -138,12 +138,16 @@ def apply_policy_actions(processed_emails: list, dry_run: bool = False, db_path=
                     db_path=db_path
                 )
                 
+                import html
                 # Notify Telegram with the full text sent
+                safe_sender = html.escape(str(sender), quote=False)
+                safe_subject = html.escape(str(reply_subject), quote=False)
+                safe_body = html.escape(str(draft_reply), quote=False)
                 notify_msg = (
                     f"🤖 <b>MailPilot Auto-Sent Reply</b> (Whitelisted Sender)\n"
-                    f"<b>To:</b> {sender}\n"
-                    f"<b>Subject:</b> {reply_subject}\n\n"
-                    f"<b>Message Body:</b>\n{draft_reply}"
+                    f"<b>To:</b> {safe_sender}\n"
+                    f"<b>Subject:</b> {safe_subject}\n\n"
+                    f"<b>Message Body:</b>\n{safe_body}"
                 )
                 if config.TELEGRAM_CHAT_ID:
                     send_telegram_message(config.TELEGRAM_CHAT_ID, notify_msg)

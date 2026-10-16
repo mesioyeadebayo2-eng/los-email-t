@@ -52,12 +52,16 @@ def main():
     parser.add_argument("--mark-read", action="store_true", help="Mark fetched emails as read.")
     parser.add_argument("--telegram", action="store_true", help="Send digest to Telegram instead of terminal.")
     parser.add_argument("--daemon", action="store_true", help="Run the scheduler daemon without webhook mode.")
+    parser.add_argument("--poll", action="store_true", help="Run local Telegram listener in polling mode (no ngrok required).")
     args = parser.parse_args()
 
     # Ensure persistence layer is ready
     db.init_db()
 
-    if args.daemon:
+    if args.poll:
+        from poll import run_polling
+        run_polling()
+    elif args.daemon:
         logger.info(f"🚀 Starting MailPilot Daemon (Scheduler-only mode, dry_run={args.dry_run})...")
         scheduler = create_scheduler(dry_run=args.dry_run, mark_read=args.mark_read, standalone=True)
         try:
