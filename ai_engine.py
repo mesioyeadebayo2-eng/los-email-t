@@ -228,22 +228,29 @@ def parse_user_command(command_text: str, user_memories: dict = None, recent_not
     Parse the user's message and return a JSON object with an 'intent'.
     
     Valid intents:
-    1. "digest": The user wants to check/process their unread emails. If they mention emailing the digest to themselves or the owner (e.g., "email the digest to the owner", "email me the digest", "send digest to my email"), set 'email_to_owner': true, otherwise false.
+    1. "digest": The user wants to check/process their unread emails. If they mention emailing the digest to themselves or the owner (e.g., "email the digest to myself", "email me the digest", "send digest to my email"), set 'email_to_owner': true, otherwise false.
     2. "unread_count": The user specifically wants to know how many unread emails they have.
     3. "summarize": The user wants a summary of the last N emails (return 'count' integer, default 5).
     4. "get_draft": The user wants to see the drafted reply for a specific email ID (return 'email_id' string, e.g. "3" for "#3").
-    5. "send_email": The user wants to draft/send an email. 
-       - You MUST extract 'to_email'. If the user refers to 'me', 'myself', 'the owner', 'my email', or 'my inbox', set 'to_email' to '{owner_email}'. If no email address is specified or implied, return null.
+    5. "send_email": The user wants to draft or send an email to a recipient or client.
+       - The user is the SENDER. The external contact/client is the RECEIVER.
+       - You MUST extract 'to_email'. If an email address is mentioned, extract it as 'to_email'.
+       - NEVER set 'to_email' to '{owner_email}' if the user is asking to send to a client, external recipient, or another email address.
+       - Only set 'to_email' to '{owner_email}' if the user specifically and explicitly asks to send an email to themselves or to their own inbox.
+       - If no recipient email address is specified in the prompt, set 'to_email' to null.
+       - If the user says "immediately", "right now", "directly", or "without asking", set 'direct_send': true, otherwise false.
        - Write a professional email body and subject based strictly on the user's prompt.
        - NEVER include requests for money, credentials, gift cards, or attachments.
-    6. "remember": The user is sharing a personal fact or asking you to save information about them (e.g., "My name is Prince", "Save my name as Prince", "I prefer concise replies").
+    6. "confirm_send": The user is confirming or commanding to deliver a pending email (e.g. "yes", "send it", "confirm", "send to client", "do it", "send now", "approved", "go ahead").
+    7. "cancel_send": The user is cancelling a pending email (e.g. "cancel", "don't send", "stop", "no", "nevermind").
+    8. "remember": The user is sharing a personal fact or asking you to save information about them (e.g., "My name is Prince", "Save my name as Prince", "I prefer concise replies").
        - Return 'key' (e.g. 'user_name', 'preference', etc.), 'value' (e.g. 'Prince'), and a natural confirming 'response'.
-    7. "take_note": The user wants to write down a task, reminder, or note (e.g., "Remind me to call John at 3pm", "Note down buy milk", "Save a note that...").
+    9. "take_note": The user wants to write down a task, reminder, or note (e.g., "Remind me to call John at 3pm", "Note down buy milk", "Save a note that...").
        - Return 'note' (the note content) and a natural confirming 'response'.
-    8. "get_notes": The user is asking to see or review their saved notes or reminders.
-    9. "conversational": The user is greeting, asking questions about themselves (e.g., "Do you know my name?"), asking advice, general knowledge, productivity tips, or chatting.
-       - Provide a natural, friendly, executive 'response' using their profile/name if known.
-       - Write responses that sound natural and conversational when spoken aloud by TTS.
+    10. "get_notes": The user is asking to see or review their saved notes or reminders.
+    11. "conversational": The user is greeting, asking questions about themselves (e.g., "Do you know my name?"), asking advice, general knowledge, productivity tips, or chatting.
+        - Provide a natural, friendly, executive 'response' using their profile/name if known.
+        - Write responses that sound natural and conversational when spoken aloud by TTS.
     
     Always output standard JSON.
     """

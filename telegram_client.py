@@ -92,16 +92,18 @@ def send_send_confirmation(chat_id: str, confirmation_id: str, to_address: str, 
 
     message_body = (
         f"✉️ <b>Outgoing Email Preview</b>\n\n"
-        f"<b>To:</b> <code>{safe_to}</code>\n"
+        f"<b>To (Client/Receiver):</b> <code>{safe_to}</code>\n"
         f"<b>Subject:</b> {safe_subject}\n\n"
         f"{att_block}"
         f"<b>Body:</b>\n{safe_body}\n\n"
-        f"<i>Please review and confirm sending:</i>"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👉 <b>To deliver this email to {safe_to}:</b>\n"
+        f"Tap <b>[✅ Send to Client]</b> below OR reply <b>\"SEND\"</b>."
     )
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "✅ Confirm", "callback_data": f"confirm:{confirmation_id}"},
+                {"text": "✅ Send to Client", "callback_data": f"confirm:{confirmation_id}"},
                 {"text": "✏️ Edit", "callback_data": f"edit:{confirmation_id}"},
                 {"text": "❌ Cancel", "callback_data": f"cancel:{confirmation_id}"}
             ]

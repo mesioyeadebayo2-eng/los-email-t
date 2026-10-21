@@ -364,6 +364,34 @@ def get_pending_send(send_id: str, db_path=None) -> dict | None:
             }
     return None
 
+def get_latest_pending_send(db_path=None) -> dict | None:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(
+            cursor,
+            "SELECT id, to_address, subject, body, attachments, status, created_at FROM pending_sends WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1",
+            is_pg=pg
+        )
+        row = cursor.fetchone()
+        if row:
+            raw_att = row["attachments"] if "attachments" in row.keys() else "[]"
+            try:
+                parsed_att = json.loads(raw_att) if raw_att else []
+            except Exception:
+                parsed_att = []
+            return {
+                "id": row["id"],
+                "to_address": row["to_address"],
+                "subject": row["subject"],
+                "body": row["body"],
+                "attachments": parsed_att,
+                "status": row["status"],
+                "created_at": str(row["created_at"])
+            }
+    return None
+
+
 def confirm_pending_send(send_id: str, db_path=None) -> tuple[bool, dict | None]:
     """
     Atomic idempotency guard: transitions status from 'pending' to 'sent'.

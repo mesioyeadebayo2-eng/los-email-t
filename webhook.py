@@ -86,6 +86,48 @@ def webhook():
 
     return jsonify({"status": "ok"}), 200
 
+def is_confirmation_phrase(text: str) -> bool:
+    clean = text.strip().lower()
+    if clean in ("yes", "y", "send", "send it", "send now", "confirm", "send to client", "send to receiver", 
+                 "do it", "approved", "go ahead", "ok", "okay", "proceed", "deliver", "ship it", "sure", 
+                 "please send", "send please", "send the email", "send email now", "yes please", "yes send", "send it now"):
+        return True
+    return bool(re.match(r'^(yes|confirm|send\s*(it|now|to\s*client|to\s*receiver|email)?|do\s*it|approved?|proceed|deliver)\b', clean))
+
+def is_cancellation_phrase(text: str) -> bool:
+    clean = text.strip().lower()
+    return clean in ("cancel", "stop", "don't send", "dont send", "no", "nevermind", "abort", "cancel it", "discard")
+
+def process_pending_send_dispatch(chat_id: str, pending_data: dict, voice_reply: bool = False):
+    acquired, send_data = db.confirm_pending_send(pending_data["id"])
+    if acquired and send_data:
+        to_addr = send_data["to_address"]
+        subj = send_data["subject"]
+        body = send_data["body"]
+        attachments = send_data.get("attachments", [])
+        att_desc = f" with {len(attachments)} attachment(s)" if attachments else ""
+        send_telegram_message(chat_id, f"✉️ <b>Delivering email to client {to_addr}{att_desc}...</b>")
+        success = send_email(to_addr, subj, body, attachments=attachments)
+        if success:
+            send_reply(
+                chat_id,
+                f"✅ <b>Email delivered successfully to client!</b>\n\n"
+                f"<b>To:</b> <code>{to_addr}</code>\n"
+                f"<b>Subject:</b> {subj}",
+                voice_reply,
+                spoken_override=f"Your email to {to_addr} has been delivered successfully."
+            )
+        else:
+            send_reply(
+                chat_id,
+                f"❌ Failed to send email to <b>{to_addr}</b> via Gmail SMTP. Check server logs.",
+                voice_reply,
+                spoken_override=f"I was unable to send the email to {to_addr}. Please check your Gmail connection."
+            )
+    else:
+        send_reply(chat_id, "⚠️ This email has already been sent or cancelled.", voice_reply)
+    return jsonify({"status": "ok"}), 200
+
 def handle_telegram_callback(cb: dict):
     query_id = cb.get("id")
     user_id = str(cb.get("from", {}).get("id", ""))
@@ -116,12 +158,12 @@ def handle_telegram_callback(cb: dict):
             attachments = send_data.get("attachments", [])
             
             att_desc = f" with {len(attachments)} attachment(s)" if attachments else ""
-            send_telegram_message(chat_id, f"✉️ <b>Sending email to {to_addr}{att_desc}...</b>")
+            send_telegram_message(chat_id, f"✉️ <b>Delivering email to client {to_addr}{att_desc}...</b>")
             success = send_email(to_addr, subj, body, attachments=attachments)
             if success:
-                send_telegram_message(chat_id, f"✅ Email sent successfully to <b>{to_addr}</b>!")
+                send_telegram_message(chat_id, f"✅ <b>Email delivered successfully to client!</b>\n\n<b>To:</b> <code>{to_addr}</code>\n<b>Subject:</b> {subj}")
             else:
-                send_telegram_message(chat_id, f"❌ Failed to send email to <b>{to_addr}</b>. Check logs.")
+                send_telegram_message(chat_id, f"❌ Failed to send email to <b>{to_addr}</b> via Gmail SMTP. Check server logs.")
         else:
             answer_callback_query(query_id, "Already sent or cancelled")
             send_telegram_message(chat_id, "⚠️ This email has already been sent, cancelled, or does not exist.")
@@ -185,6 +227,16 @@ def handle_telegram_incoming_message(msg: dict):
 
             logger.info(f"Voice note transcribed: '{transcribed_text}'")
             send_telegram_message(chat_id, f"🎙️ <i>Voice input:</i> \"{html.escape(transcribed_text)}\"")
+
+            latest_pending = db.get_latest_pending_send()
+            if latest_pending:
+                if is_confirmation_phrase(transcribed_text):
+                    return process_pending_send_dispatch(chat_id, latest_pending, voice_reply=True)
+                elif is_cancellation_phrase(transcribed_text):
+                    db.cancel_pending_send(latest_pending["id"])
+                    send_reply(chat_id, f"❌ Cancelled pending email to <b>{latest_pending['to_address']}</b>.", voice_reply=True)
+                    return jsonify({"status": "ok"}), 200
+
             handle_telegram_intent(transcribed_text, chat_id, voice_reply=True)
             return jsonify({"status": "ok"}), 200
 
@@ -208,7 +260,8 @@ def handle_telegram_incoming_message(msg: dict):
             # Check if user instructed to email this photo
             if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
                 intent_data = parse_user_command(caption)
-                to_email = intent_data.get("to_email")
+                found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', caption)
+                to_email = found_emails[0] if found_emails else intent_data.get("to_email")
                 subject = intent_data.get("subject") or "Photo Attached"
                 body = intent_data.get("body") or "Please find the attached photo."
                 if to_email and "@" in to_email:
@@ -242,7 +295,8 @@ def handle_telegram_incoming_message(msg: dict):
         # Check if user wants to email this document
         if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
             intent_data = parse_user_command(caption)
-            to_email = intent_data.get("to_email")
+            found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', caption)
+            to_email = found_emails[0] if found_emails else intent_data.get("to_email")
             subject = intent_data.get("subject") or f"Document: {file_name}"
             body = intent_data.get("body") or f"Please find attached {file_name}."
             if to_email and "@" in to_email:
@@ -321,6 +375,16 @@ def handle_telegram_incoming_message(msg: dict):
             handle_telegram_intent("give me my morning audio briefing", chat_id, voice_reply=True)
             return jsonify({"status": "ok"}), 200
 
+    # Check if user confirmed or cancelled an existing pending send
+    latest_pending = db.get_latest_pending_send()
+    if latest_pending:
+        if is_confirmation_phrase(text_body):
+            return process_pending_send_dispatch(chat_id, latest_pending, voice_reply=False)
+        elif is_cancellation_phrase(text_body):
+            db.cancel_pending_send(latest_pending["id"])
+            send_telegram_message(chat_id, f"❌ Cancelled pending email to <b>{latest_pending['to_address']}</b>.")
+            return jsonify({"status": "ok"}), 200
+
     # Check if user specifically requested a voice reply in text
     voice_requested = any(w in text_body.lower() for w in ["voice note", "in voice", "speak to me", "voice reply", "audio message", "say it"])
     handle_telegram_intent(text_body, chat_id, voice_reply=voice_requested)
@@ -332,7 +396,22 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
     intent_data = parse_user_command(cmd)
     intent = intent_data.get("intent", "conversational")
 
-    if intent == "remember":
+    if intent == "confirm_send":
+        latest_pending = db.get_latest_pending_send()
+        if latest_pending:
+            return process_pending_send_dispatch(chat_id, latest_pending, voice_reply)
+        else:
+            send_reply(chat_id, "There are no pending emails waiting to be sent.", voice_reply)
+
+    elif intent == "cancel_send":
+        latest_pending = db.get_latest_pending_send()
+        if latest_pending:
+            db.cancel_pending_send(latest_pending["id"])
+            send_reply(chat_id, f"❌ Cancelled pending email to <b>{latest_pending['to_address']}</b>.", voice_reply)
+        else:
+            send_reply(chat_id, "There are no pending emails to cancel.", voice_reply)
+
+    elif intent == "remember":
         key = intent_data.get("key", "user_profile")
         val = intent_data.get("value", "")
         db.set_user_memory(key, val)
@@ -377,7 +456,7 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
         digest_text = format_telegram_digest(processed)
         send_telegram_message(chat_id, digest_text)
 
-        email_to_owner = intent_data.get("email_to_owner", False) or any(w in cmd.lower() for w in ("email to", "send to my email", "send to email", "email digest", "email me", "to the owner", "to owner"))
+        email_to_owner = intent_data.get("email_to_owner", False) or any(w in cmd.lower() for w in ("email to myself", "send to my email", "send digest to my email", "email digest to me", "email to the owner", "email to owner"))
         if email_to_owner and config.GMAIL_USER:
             try:
                 from digest import send_email_digest_to_owner
@@ -439,20 +518,58 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
         subject = intent_data.get("subject", "Update")
         body = intent_data.get("body", "")
         
-        # Auto-resolve owner or self references
-        if not to_email or to_email.lower() in ("me", "myself", "owner", "the owner"):
+        # 1. Deterministic regex search for recipient email address in the user's command
+        found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', cmd)
+        if found_emails:
+            # Client / recipient is explicitly specified in the message
+            to_email = found_emails[0]
+        elif to_email and "@" in to_email:
+            to_email = to_email.strip()
+        else:
+            # Only resolve to owner if the user EXPLICITLY requested to email themselves
             cmd_lower = cmd.lower()
-            if any(w in cmd_lower for w in ("owner", "me", "myself", "my email", "my inbox")):
+            if any(w in cmd_lower for w in ("to myself", "to my own inbox", "to the owner", "to my email")) and not any(w in cmd_lower for w in ("client", "customer", "receiver", "why will i")):
                 to_email = config.GMAIL_USER
-        
+            else:
+                to_email = None
+
         if not to_email or "@" not in to_email:
-            send_reply(chat_id, "I need a valid email address to send that. Could you repeat the command with the email address?", voice_reply)
+            send_reply(
+                chat_id,
+                "Who would you like to send this email to? Please provide the client's email address (e.g. <code>client@example.com</code>).",
+                voice_reply,
+                spoken_override="Who would you like to send this email to? Please provide the client's email address."
+            )
+            return
+
+        cmd_lower = cmd.lower()
+        is_direct = intent_data.get("direct_send", False) or any(w in cmd_lower for w in ("immediately", "right now", "directly", "auto send", "send now", "without preview", "deliver now"))
+
+        if is_direct:
+            send_telegram_message(chat_id, f"✉️ <b>Delivering email directly to client {to_email}...</b>")
+            success = send_email(to_email, subject, body)
+            if success:
+                confirmation_id = db.create_pending_send(to_email, subject, body)
+                db.confirm_pending_send(confirmation_id)
+                send_reply(
+                    chat_id,
+                    f"✅ <b>Email delivered successfully to client!</b>\n\n<b>To:</b> <code>{to_email}</code>\n<b>Subject:</b> {subject}",
+                    voice_reply,
+                    spoken_override=f"Your email to {to_email} has been sent directly."
+                )
+            else:
+                send_reply(
+                    chat_id,
+                    f"❌ Failed to send email to <b>{to_email}</b> via Gmail SMTP. Check server logs.",
+                    voice_reply,
+                    spoken_override=f"Failed to deliver email to {to_email}."
+                )
             return
 
         confirmation_id = db.create_pending_send(to_email, subject, body)
         send_send_confirmation(chat_id, confirmation_id, to_email, subject, body)
         if voice_reply:
-            spoken = f"I've drafted your email to {to_email} with subject {subject}. Please review and tap confirm in Telegram to send it."
+            spoken = f"I've drafted your email to {to_email} with subject {subject}. Please review and tap send to client in Telegram, or reply send."
             audio = voice_engine.generate_speech(spoken, voice="cedar")
             if audio:
                 send_telegram_voice(chat_id, audio)
