@@ -62,6 +62,31 @@ def healthz():
         "gmail_user": config.GMAIL_USER[:4] + "***" if config.GMAIL_USER else ""
     }), status_code
 
+@app.route('/smtp-check', methods=['GET'])
+def smtp_check():
+    import smtplib
+    results = {}
+    # Test 465 SSL
+    try:
+        s = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=7)
+        s.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
+        s.quit()
+        results["port_465"] = "OK"
+    except Exception as e:
+        results["port_465"] = f"{type(e).__name__}: {e}"
+        
+    # Test 587 STARTTLS
+    try:
+        s587 = smtplib.SMTP("smtp.gmail.com", 587, timeout=7)
+        s587.starttls()
+        s587.login(config.GMAIL_USER, config.GMAIL_APP_PASSWORD)
+        s587.quit()
+        results["port_587"] = "OK"
+    except Exception as e:
+        results["port_587"] = f"{type(e).__name__}: {e}"
+        
+    return jsonify(results), 200
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     # 1. Validate X-Telegram-Bot-Api-Secret-Token Header
