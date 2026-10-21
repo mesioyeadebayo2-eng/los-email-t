@@ -367,6 +367,16 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
         digest_text = format_telegram_digest(processed)
         send_telegram_message(chat_id, digest_text)
 
+        email_to_owner = intent_data.get("email_to_owner", False) or any(w in cmd.lower() for w in ("email to", "send to my email", "send to email", "email digest", "email me", "to the owner", "to owner"))
+        if email_to_owner and config.GMAIL_USER:
+            try:
+                from digest import send_email_digest_to_owner
+                email_sent = send_email_digest_to_owner(processed)
+                if email_sent:
+                    send_telegram_message(chat_id, f"📧 <i>A copy of this digest has also been sent to your email (<b>{config.GMAIL_USER}</b>)</i>")
+            except Exception as e_dig:
+                logger.warning(f"Failed sending email digest to owner: {e_dig}")
+
         if voice_reply:
             urgent_count = sum(1 for e in processed if e.get("urgency") == "URGENT")
             user_name = db.get_user_memory("user_name") or "there"
@@ -418,6 +428,12 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
         to_email = intent_data.get("to_email")
         subject = intent_data.get("subject", "Update")
         body = intent_data.get("body", "")
+        
+        # Auto-resolve owner or self references
+        if not to_email or to_email.lower() in ("me", "myself", "owner", "the owner"):
+            cmd_lower = cmd.lower()
+            if any(w in cmd_lower for w in ("owner", "me", "myself", "my email", "my inbox")):
+                to_email = config.GMAIL_USER
         
         if not to_email or "@" not in to_email:
             send_reply(chat_id, "I need a valid email address to send that. Could you repeat the command with the email address?", voice_reply)

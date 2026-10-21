@@ -39,3 +39,34 @@ def print_terminal_digest(emails: list):
         )
 
     console.print(Panel(table, title="📬 MailPilot Daily Digest", border_style="blue"))
+
+def format_email_digest(emails: list) -> str:
+    if not emails:
+        return "No new unread emails to report."
+
+    lines = ["📬 MailPilot Email Digest", "=" * 32, ""]
+    for e in emails:
+        urgency = e.get("urgency", "NORMAL")
+        cat = e.get("category", "Unknown")
+        sender = e.get("sender", "")
+        subject = e.get("subject", "")
+        summary = e.get("summary", "")
+        draft = e.get("draft_reply", "")
+
+        lines.append(f"• [{urgency}] {sender}")
+        lines.append(f"  Subject: {subject}")
+        lines.append(f"  Category: {cat}")
+        lines.append(f"  Summary: {summary}")
+        if draft:
+            lines.append(f"  Proposed Draft Reply:\n    \"{draft}\"")
+        lines.append("-" * 32)
+    return "\n".join(lines)
+
+def send_email_digest_to_owner(emails: list) -> bool:
+    import config
+    if not config.GMAIL_USER:
+        return False
+    from gmail_client import send_email
+    subject = f"📬 MailPilot Daily Digest ({len(emails)} unread emails)"
+    body = format_email_digest(emails)
+    return send_email(config.GMAIL_USER, subject, body)

@@ -17,15 +17,25 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
 
 _instance_socket = None
 
-def acquire_instance_lock(port=54321):
+def acquire_instance_lock(port=54322):
     global _instance_socket
     _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        _instance_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         _instance_socket.bind(("127.0.0.1", port))
         return True
     except socket.error:
         print("⚠️ Another instance of MailPilot Telegram Poller is already active. Exiting to avoid 409 Conflict.")
         sys.exit(0)
+
+# Force IPv4 resolution to prevent Windows IPv6 timeout/aborts with Telegram
+try:
+    _orig_getaddrinfo = socket.getaddrinfo
+    def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = _getaddrinfo_ipv4
+except Exception:
+    pass
 
 def run_polling():
     acquire_instance_lock()
@@ -35,8 +45,14 @@ def run_polling():
 
     print("🤖 Starting MailPilot in Telegram Polling Mode (Local Dev / Testing)...")
     print("📡 Clearing any active webhook on Telegram...")
+    
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504]))
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
     try:
-        r = requests.post(f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
+        r = session.post(f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=15)
         print(f"Webhook status: {r.json().get('description', 'Cleared')}")
     except Exception as e:
         print(f"Warning clearing webhook: {e}")
@@ -49,7 +65,7 @@ def run_polling():
         try:
             url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates"
             params = {"offset": offset, "timeout": 15}
-            response = requests.get(url, params=params, timeout=25)
+            response = session.get(url, params=params, timeout=30)
             
             if response.status_code != 200:
                 logger.warning(f"Telegram getUpdates returned HTTP {response.status_code}: {response.text}")
