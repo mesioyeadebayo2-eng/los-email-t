@@ -49,8 +49,18 @@ init_background_scheduler()
 @app.route('/healthz', methods=['GET'])
 def healthz():
     db_healthy = db.check_db_health()
+    gmail_configured = bool(config.GMAIL_USER and config.GMAIL_APP_PASSWORD)
+    openai_configured = bool(config.OPENAI_API_KEY)
+    telegram_configured = bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID)
     status_code = 200 if db_healthy else 500
-    return jsonify({"ok": db_healthy, "db": db_healthy}), status_code
+    return jsonify({
+        "ok": db_healthy,
+        "db": db_healthy,
+        "gmail": gmail_configured,
+        "openai": openai_configured,
+        "telegram": telegram_configured,
+        "gmail_user": config.GMAIL_USER[:4] + "***" if config.GMAIL_USER else ""
+    }), status_code
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
