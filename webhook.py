@@ -230,6 +230,23 @@ def handle_telegram_incoming_message(msg: dict):
 
             latest_pending = db.get_latest_pending_send()
             if latest_pending:
+                if any(phrase in transcribed_text.lower() for phrase in (
+                    "the body of the letter", "body of the letter", "the body of email", "what is the body", 
+                    "show body", "what does it say", "show letter", "view body", "check body", "read the body"
+                )):
+                    send_send_confirmation(chat_id, latest_pending["id"], latest_pending["to_address"], latest_pending["subject"], latest_pending["body"], attachments=latest_pending.get("attachments"))
+                    send_reply(
+                        chat_id,
+                        f"📄 <b>Letter Body for {latest_pending['to_address']}:</b>\n\n"
+                        f"{html.escape(latest_pending['body'])}\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"👉 <b>To edit body:</b> Reply <code>Change body to: &lt;new text&gt;</code>\n"
+                        f"👉 <b>To send:</b> Tap <b>[✅ Send to Client]</b> above or reply <b>\"SEND\"</b>.",
+                        voice_reply=True,
+                        spoken_override=f"The current letter body to {latest_pending['to_address']} reads: {latest_pending['body']}"
+                    )
+                    return jsonify({"status": "ok"}), 200
+
                 if is_confirmation_phrase(transcribed_text):
                     return process_pending_send_dispatch(chat_id, latest_pending, voice_reply=True)
                 elif is_cancellation_phrase(transcribed_text):
@@ -378,8 +395,36 @@ def handle_telegram_incoming_message(msg: dict):
     # Check if user confirmed or cancelled an existing pending send
     latest_pending = db.get_latest_pending_send()
     if latest_pending:
+        # 1. User wants to check/view the body of the letter
+        if any(phrase in text_body.lower() for phrase in (
+            "the body of the letter", "body of the letter", "the body of email", "what is the body", 
+            "show body", "what does it say", "show letter", "view body", "check body", "read the body"
+        )):
+            send_send_confirmation(chat_id, latest_pending["id"], latest_pending["to_address"], latest_pending["subject"], latest_pending["body"], attachments=latest_pending.get("attachments"))
+            send_telegram_message(
+                chat_id,
+                f"📄 <b>Letter Body for {latest_pending['to_address']}:</b>\n\n"
+                f"{html.escape(latest_pending['body'])}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👉 <b>To edit body:</b> Reply <code>Change body to: &lt;new text&gt;</code>\n"
+                f"👉 <b>To send:</b> Tap <b>[✅ Send to Client]</b> above or reply <b>\"SEND\"</b>."
+            )
+            return jsonify({"status": "ok"}), 200
+
+        # 2. User wants to update/edit the body directly in chat
+        if bool(re.match(r'^(change\s*body\s*to|update\s*body\s*to|edit\s*body\s*to|change\s*message\s*to|update\s*message\s*to|edit\s*body|update\s*body|body|message)\s*[:=]\s*', text_body, flags=re.IGNORECASE)):
+            from ai_engine import sanitize_email_body
+            new_body = re.sub(r'^(change\s*body\s*to|update\s*body\s*to|edit\s*body\s*to|change\s*message\s*to|update\s*message\s*to|edit\s*body|update\s*body|body|message)\s*[:=]\s*', '', text_body, flags=re.IGNORECASE).strip()
+            clean_body = sanitize_email_body(new_body)
+            db.update_pending_send_body(latest_pending["id"], clean_body)
+            send_send_confirmation(chat_id, latest_pending["id"], latest_pending["to_address"], latest_pending["subject"], clean_body, attachments=latest_pending.get("attachments"))
+            send_telegram_message(chat_id, f"✏️ <b>Letter body updated!</b> Review the preview above and tap <b>[✅ Send to Client]</b> or reply <b>\"SEND\"</b>.")
+            return jsonify({"status": "ok"}), 200
+
+        # 3. User confirmed sending
         if is_confirmation_phrase(text_body):
             return process_pending_send_dispatch(chat_id, latest_pending, voice_reply=False)
+        # 4. User cancelled sending
         elif is_cancellation_phrase(text_body):
             db.cancel_pending_send(latest_pending["id"])
             send_telegram_message(chat_id, f"❌ Cancelled pending email to <b>{latest_pending['to_address']}</b>.")
@@ -410,6 +455,18 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
             send_reply(chat_id, f"❌ Cancelled pending email to <b>{latest_pending['to_address']}</b>.", voice_reply)
         else:
             send_reply(chat_id, "There are no pending emails to cancel.", voice_reply)
+
+    elif intent == "update_body":
+        latest_pending = db.get_latest_pending_send()
+        new_body = intent_data.get("new_body", "").strip()
+        if latest_pending and new_body:
+            from ai_engine import sanitize_email_body
+            clean_body = sanitize_email_body(new_body)
+            db.update_pending_send_body(latest_pending["id"], clean_body)
+            send_send_confirmation(chat_id, latest_pending["id"], latest_pending["to_address"], latest_pending["subject"], clean_body, attachments=latest_pending.get("attachments"))
+            send_reply(chat_id, f"✏️ <b>Letter body updated!</b> Review the preview above and tap <b>[✅ Send to Client]</b> or reply <b>\"SEND\"</b>.", voice_reply)
+        else:
+            send_reply(chat_id, "There are no pending emails waiting to be edited.", voice_reply)
 
     elif intent == "remember":
         key = intent_data.get("key", "user_profile")

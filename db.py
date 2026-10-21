@@ -453,6 +453,28 @@ def cancel_pending_send(send_id: str, db_path=None) -> bool:
         conn.commit()
         return updated
 
+def update_pending_send_body(send_id: str, new_body: str, new_subject: str = None, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if new_subject:
+            _exec(
+                cursor,
+                "UPDATE pending_sends SET body = ?, subject = ? WHERE id = ? AND status = 'pending'",
+                (new_body, new_subject, send_id),
+                is_pg=pg
+            )
+        else:
+            _exec(
+                cursor,
+                "UPDATE pending_sends SET body = ? WHERE id = ? AND status = 'pending'",
+                (new_body, send_id),
+                is_pg=pg
+            )
+        updated = cursor.rowcount > 0
+        conn.commit()
+        return updated
+
 def set_user_memory(key: str, value: str, db_path=None):
     pg = is_postgres(db_path)
     now = datetime.now().isoformat()

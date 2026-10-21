@@ -105,3 +105,57 @@ def test_cancellation_text(client_app):
         
     updated = db.get_pending_send(send_id, db_path=test_db)
     assert updated["status"] == "cancelled"
+
+def test_sanitize_email_body():
+    from ai_engine import sanitize_email_body
+    raw = "Dear [Recipient's Name],\n\nProposal attached.\n\nBest regards,\n\n[Your Name]"
+    sanitized_no_name = sanitize_email_body(raw)
+    assert "[Your Name]" not in sanitized_no_name
+    assert "[Recipient's Name]" not in sanitized_no_name
+    assert sanitized_no_name.endswith("Best regards,")
+
+    sanitized_with_name = sanitize_email_body(raw, sender_name="Adebayo")
+    assert "[Your Name]" not in sanitized_with_name
+    assert "Adebayo" in sanitized_with_name
+
+def test_view_letter_body(client_app):
+    client, test_db = client_app
+    client_email = "investor@example.com"
+    send_id = db.create_pending_send(client_email, "Q3 Report", "Here is the comprehensive Q3 financial review.", db_path=test_db)
+
+    with patch("webhook.send_telegram_message") as mock_tg:
+        resp = client.post(
+            "/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "test_secret"},
+            json={
+                "message": {
+                    "chat": {"id": 123456},
+                    "text": "the body of the letter?"
+                }
+            }
+        )
+        assert resp.status_code == 200
+        # Check that the body was sent in a telegram message
+        assert any("Here is the comprehensive Q3 financial review." in str(call) for call in mock_tg.call_args_list)
+
+def test_edit_letter_body(client_app):
+    client, test_db = client_app
+    client_email = "investor@example.com"
+    send_id = db.create_pending_send(client_email, "Q3 Report", "Old initial draft.", db_path=test_db)
+
+    with patch("webhook.send_telegram_message") as mock_tg:
+        resp = client.post(
+            "/webhook",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "test_secret"},
+            json={
+                "message": {
+                    "chat": {"id": 123456},
+                    "text": "Change body to: Updated final review numbers for Q3."
+                }
+            }
+        )
+        assert resp.status_code == 200
+        
+    updated = db.get_pending_send(send_id, db_path=test_db)
+    assert updated["body"] == "Updated final review numbers for Q3."
+
