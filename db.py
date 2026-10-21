@@ -324,6 +324,8 @@ def create_pending_send(to_address: str, subject: str, body: str, attachments: l
     att_json = json.dumps(attachments or [])
     with get_db_connection(db_path) as conn:
         cursor = _get_cursor(conn, pg)
+        # Cancel any previous stale pending sends so only the new draft is pending
+        _exec(cursor, "UPDATE pending_sends SET status = 'cancelled' WHERE status = 'pending'", is_pg=pg)
         _exec(
             cursor,
             """

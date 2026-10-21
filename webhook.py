@@ -111,16 +111,43 @@ def webhook():
 
     return jsonify({"status": "ok"}), 200
 
+def extract_clean_email(text: str):
+    """Extract a valid, sanitized email address from arbitrary text, stripping trailing punctuation and extra words."""
+    if not text:
+        return None
+    matches = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,10}', text)
+    if matches:
+        candidate = matches[0].strip().rstrip('.,;:')
+        return candidate.lower()
+    return None
+
 def is_confirmation_phrase(text: str) -> bool:
+    if not text:
+        return False
     clean = text.strip().lower()
-    if clean in ("yes", "y", "send", "send it", "send now", "confirm", "send to client", "send to receiver", 
-                 "do it", "approved", "go ahead", "ok", "okay", "proceed", "deliver", "ship it", "sure", 
-                 "please send", "send please", "send the email", "send email now", "yes please", "yes send", "send it now"):
+    # 1. Exact confirmations ALWAYS return True
+    if clean in (
+        "yes", "y", "send", "send it", "send now", "confirm", "send to client", "send to receiver", 
+        "do it", "approved", "go ahead", "ok", "okay", "proceed", "deliver", "ship it", "sure", 
+        "please send", "send please", "send the email", "send email now", "yes please", "yes send", "send it now"
+    ):
         return True
-    return bool(re.match(r'^(yes|confirm|send\s*(it|now|to\s*client|to\s*receiver|email)?|do\s*it|approved?|proceed|deliver)\b', clean))
+    # 2. If the user's message contains an email address or is a new send command, it is NEVER a confirmation!
+    if "@" in clean:
+        return False
+    if any(clean.startswith(prefix) for prefix in (
+        "send to ", "send an email to ", "send email to ", "email to ", "write to ", "mail to ", "send a "
+    )):
+        return False
+    # 3. Match only entire phrases, never open-ended start of sentence
+    return bool(re.match(r'^(yes|confirm|send\s*(it|now|to\s*client|to\s*receiver|the\s*email)?|do\s*it|approved?|proceed|deliver)$', clean))
 
 def is_cancellation_phrase(text: str) -> bool:
+    if not text:
+        return False
     clean = text.strip().lower()
+    if "@" in clean:
+        return False
     return clean in ("cancel", "stop", "don't send", "dont send", "no", "nevermind", "abort", "cancel it", "discard")
 
 def process_pending_send_dispatch(chat_id: str, pending_data: dict, voice_reply: bool = False):
@@ -302,8 +329,7 @@ def handle_telegram_incoming_message(msg: dict):
             # Check if user instructed to email this photo
             if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
                 intent_data = parse_user_command(caption)
-                found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', caption)
-                to_email = found_emails[0] if found_emails else intent_data.get("to_email")
+                to_email = extract_clean_email(caption) or extract_clean_email(intent_data.get("to_email") or "")
                 subject = intent_data.get("subject") or "Photo Attached"
                 body = intent_data.get("body") or "Please find the attached photo."
                 if to_email and "@" in to_email:
@@ -337,8 +363,7 @@ def handle_telegram_incoming_message(msg: dict):
         # Check if user wants to email this document
         if any(k in caption.lower() for k in ["send to", "email to", "send this", "email this"]):
             intent_data = parse_user_command(caption)
-            found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', caption)
-            to_email = found_emails[0] if found_emails else intent_data.get("to_email")
+            to_email = extract_clean_email(caption) or extract_clean_email(intent_data.get("to_email") or "")
             subject = intent_data.get("subject") or f"Document: {file_name}"
             body = intent_data.get("body") or f"Please find attached {file_name}."
             if to_email and "@" in to_email:
@@ -601,12 +626,11 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
         body = intent_data.get("body", "")
         
         # 1. Deterministic regex search for recipient email address in the user's command
-        found_emails = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', cmd)
-        if found_emails:
-            # Client / recipient is explicitly specified in the message
-            to_email = found_emails[0]
+        extracted = extract_clean_email(cmd)
+        if extracted:
+            to_email = extracted
         elif to_email and "@" in to_email:
-            to_email = to_email.strip()
+            to_email = extract_clean_email(to_email) or to_email.strip()
         else:
             # Only resolve to owner if the user EXPLICITLY requested to email themselves
             cmd_lower = cmd.lower()
