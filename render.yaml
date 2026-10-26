@@ -40,6 +40,18 @@ services:
         generateValue: true
       - key: AUTO_ARCHIVE_FOLDER
         value: MailPilot/Archived
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FOLLOWUP_DAYS
+        value: "2"
+      - key: ALERTS_PER_HOUR_MAX
+        value: "5"
+      - key: MEMORY_ENABLED
+        value: "true"
+      - key: MEMORY_MAX_TOKENS
+        value: "500"
+      - key: MEMORY_INCLUDES_EMAILS
+        value: "false"
 
   # 2. Background Scheduler Worker
   - type: worker
@@ -71,3 +83,15 @@ services:
         value: "20"
       - key: AUTO_ARCHIVE_FOLDER
         value: MailPilot/Archived
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FOLLOWUP_DAYS
+        value: "2"
+      - key: ALERTS_PER_HOUR_MAX
+        value: "5"
+      - key: MEMORY_ENABLED
+        value: "true"
+      - key: MEMORY_MAX_TOKENS
+        value: "500"
+      - key: MEMORY_INCLUDES_EMAILS
+        value: "false"
