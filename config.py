@@ -35,8 +35,20 @@ TRIAGE_INTERVAL_MINUTES = int(os.getenv("TRIAGE_INTERVAL_MINUTES", "60"))
 # IMAP Fetch Limits
 MAX_FETCH = int(os.getenv("MAX_FETCH", "20"))
 
-# Database Configuration (Postgres support via DATABASE_URL or SQLite fallback)
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Database Configuration (Postgres / Supabase support via DATABASE_URL, SUPABASE_DATABASE_URL, or SQLite fallback)
+DATABASE_URL = (
+    os.getenv("SUPABASE_DATABASE_URL")
+    or os.getenv("SUPABASE_DB_URL")
+    or os.getenv("SUPABASE_POSTGRES_URL")
+    or os.getenv("DATABASE_URL", "")
+)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or ""
+)
 
 # Paths & Directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

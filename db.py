@@ -26,6 +26,9 @@ def get_db_connection(db_path=None):
         url = db_path if (db_path and ("postgres://" in db_path or "postgresql://" in db_path)) else config.DATABASE_URL
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
+        if "sslmode=" not in url and any(h in url.lower() for h in ("supabase", "render", "pooler", "aws")):
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}sslmode=require"
         conn = psycopg2.connect(url)
         try:
             yield conn
@@ -207,7 +210,8 @@ def init_db(db_path=None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_key ON memory(key)")
         conn.commit()
-    target_desc = "PostgreSQL (DATABASE_URL)" if pg else get_db_path(db_path)
+    is_supa = bool("supabase" in (config.DATABASE_URL or "").lower())
+    target_desc = "Supabase PostgreSQL (DATABASE_URL)" if is_supa else ("PostgreSQL (DATABASE_URL)" if pg else get_db_path(db_path))
     logger.info(f"Database initialized on {target_desc}")
 
 def reset_db(db_path=None):
@@ -1206,9 +1210,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MailPilot Database Management")
     parser.add_argument("--init", action="store_true", help="Initialize tables")
     parser.add_argument("--reset", action="store_true", help="Reset all tables")
+    parser.add_argument("--check", action="store_true", help="Check database connectivity and memory counts")
     args = parser.parse_args()
     
-    if args.reset:
+    if args.check:
+        import sys
+        if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+            try:
+                sys.stdout.reconfigure(encoding='utf-8')
+            except Exception:
+                pass
+        healthy = check_db_health()
+        backend = "Supabase PostgreSQL" if ("supabase" in (config.DATABASE_URL or "").lower()) else ("PostgreSQL" if is_postgres() else "SQLite")
+        print(f"[DB Backend] {backend}")
+        print(f"[Connectivity] Healthy: {healthy}")
+        if healthy:
+            conv_count = len(get_recent_conversations(1000))
+            mem_count = len(get_all_memories())
+            u_mem_count = len(get_all_user_memories())
+            print(f"[Memory Engine] Total Stored Memories: {mem_count}")
+            print(f"[Conversations] Total Logged Turns: {conv_count}")
+            print(f"[User Profile] Active Profile Keys: {u_mem_count}")
+            if mem_count == 0 and conv_count == 0:
+                print("[Notice] Database is connected and healthy, but has 0 memories recorded yet.")
+                print("         Cedar extracts memories automatically as you interact via Telegram, or run /memory add <fact>.")
+    elif args.reset:
         reset_db()
         print("Database reset successfully.")
     else:

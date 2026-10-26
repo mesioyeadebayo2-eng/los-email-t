@@ -55,10 +55,14 @@ def healthz():
     gmail_configured = bool(config.GMAIL_USER and config.GMAIL_APP_PASSWORD)
     openai_configured = bool(config.OPENAI_API_KEY)
     telegram_configured = bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID)
+    is_supabase = bool(config.DATABASE_URL and "supabase" in config.DATABASE_URL.lower()) or bool(config.SUPABASE_URL)
+    db_backend = "supabase" if ("supabase" in (config.DATABASE_URL or "").lower()) else ("postgresql" if config.DATABASE_URL else "sqlite")
     status_code = 200 if db_healthy else 500
     return jsonify({
         "ok": db_healthy,
         "db": db_healthy,
+        "db_backend": db_backend,
+        "supabase_connected": is_supabase and db_healthy,
         "gmail": gmail_configured,
         "openai": openai_configured,
         "telegram": telegram_configured,
