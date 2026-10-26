@@ -18,17 +18,37 @@ def is_postgres(db_path=None) -> bool:
 def get_db_path(custom_path=None):
     return custom_path or config.DB_PATH
 
+def clean_postgres_url(raw_url: str) -> str:
+    """Sanitizes brackets, encodes unescaped symbols, and adds sslmode=require for cloud Postgres/Supabase."""
+    if not raw_url:
+        return ""
+    import urllib.parse
+    import re
+    url = raw_url.strip()
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    # Strip accidental brackets around password: :[password]@
+    url = re.sub(r':\[(.*?)\]@', r':\1@', url)
+    if "://" in url and "@" in url:
+        scheme, remainder = url.split("://", 1)
+        prefix, host_part = remainder.rsplit("@", 1)
+        if ":" in prefix:
+            user, pwd = prefix.split(":", 1)
+            unquoted_pwd = urllib.parse.unquote(pwd)
+            encoded_pwd = urllib.parse.quote_plus(unquoted_pwd)
+            url = f"{scheme}://{user}:{encoded_pwd}@{host_part}"
+    if "sslmode=" not in url and any(h in url.lower() for h in ("supabase", "render", "pooler", "aws")):
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}sslmode=require"
+    return url
+
 @contextmanager
 def get_db_connection(db_path=None):
     if is_postgres(db_path):
         import psycopg2
         from psycopg2.extras import RealDictCursor
-        url = db_path if (db_path and ("postgres://" in db_path or "postgresql://" in db_path)) else config.DATABASE_URL
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql://", 1)
-        if "sslmode=" not in url and any(h in url.lower() for h in ("supabase", "render", "pooler", "aws")):
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}sslmode=require"
+        raw_url = db_path if (db_path and ("postgres://" in db_path or "postgresql://" in db_path)) else config.DATABASE_URL
+        url = clean_postgres_url(raw_url)
         conn = psycopg2.connect(url)
         try:
             yield conn
@@ -111,10 +131,14 @@ def init_db(db_path=None):
 
         # Migration: add attachments column if it doesn't exist
         try:
-            cursor.execute("ALTER TABLE pending_sends ADD COLUMN attachments TEXT")
+            if pg:
+                cursor.execute("ALTER TABLE pending_sends ADD COLUMN IF NOT EXISTS attachments TEXT")
+            else:
+                cursor.execute("ALTER TABLE pending_sends ADD COLUMN attachments TEXT")
             conn.commit()
         except Exception:
-            pass
+            if pg:
+                conn.rollback()
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_memory (
