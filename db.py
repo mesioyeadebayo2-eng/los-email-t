@@ -128,9 +128,84 @@ def init_db(db_path=None):
                 created_at TEXT
             )
         """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id {pk_type},
+                match_type TEXT NOT NULL CHECK(match_type IN ('sender', 'domain', 'keyword', 'regex')),
+                match_value TEXT NOT NULL,
+                note TEXT
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id {pk_type},
+                email_uid TEXT NOT NULL,
+                alert_reason TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                acknowledged INTEGER DEFAULT 0
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS followups (
+                id {pk_type},
+                email_uid TEXT NOT NULL,
+                sender TEXT,
+                subject TEXT,
+                direction TEXT NOT NULL CHECK(direction IN ('waiting_on_them', 'waiting_on_me')),
+                expected_by TEXT NOT NULL,
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'closed', 'cancelled')),
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS snoozes (
+                id {pk_type},
+                email_uid TEXT NOT NULL,
+                wake_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'fired', 'cancelled'))
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id {pk_type},
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                context_tag TEXT
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS memory (
+                id {pk_type},
+                key TEXT UNIQUE NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS memory_refs (
+                id {pk_type},
+                memory_id TEXT NOT NULL,
+                conversation_id INTEGER
+            )
+        """)
         
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_lookup ON processed_emails(account, folder, message_uid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_uid ON drafts(email_uid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_email_uid ON alerts(email_uid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_sent_at ON alerts(sent_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_followups_status ON followups(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_snoozes_status_wake ON snoozes(status, wake_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_key ON memory(key)")
         conn.commit()
     target_desc = "PostgreSQL (DATABASE_URL)" if pg else get_db_path(db_path)
     logger.info(f"Database initialized on {target_desc}")
@@ -143,6 +218,15 @@ def reset_db(db_path=None):
         cursor.execute("DROP TABLE IF EXISTS drafts")
         cursor.execute("DROP TABLE IF EXISTS sender_policy")
         cursor.execute("DROP TABLE IF EXISTS pending_sends")
+        cursor.execute("DROP TABLE IF EXISTS personal_notes")
+        cursor.execute("DROP TABLE IF EXISTS user_memory")
+        cursor.execute("DROP TABLE IF EXISTS watchlist")
+        cursor.execute("DROP TABLE IF EXISTS alerts")
+        cursor.execute("DROP TABLE IF EXISTS followups")
+        cursor.execute("DROP TABLE IF EXISTS snoozes")
+        cursor.execute("DROP TABLE IF EXISTS conversations")
+        cursor.execute("DROP TABLE IF EXISTS memory")
+        cursor.execute("DROP TABLE IF EXISTS memory_refs")
         conn.commit()
     init_db(db_path)
     logger.info(f"Database reset on {'PostgreSQL' if pg else get_db_path(db_path)}")
@@ -544,6 +628,564 @@ def get_personal_notes(limit: int = 10, db_path=None) -> list:
             else:
                 notes.append({"id": row[0], "content": row[1], "created_at": row[2]})
     return notes
+
+# ==================== WATCHLIST ====================
+def add_watchlist_item(match_type: str, match_value: str, note: str = "", db_path=None) -> int:
+    match_type = match_type.strip().lower()
+    if match_type not in ('sender', 'domain', 'keyword', 'regex'):
+        raise ValueError(f"Invalid match_type: {match_type}")
+    match_value = match_value.strip()
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute("INSERT INTO watchlist (match_type, match_value, note) VALUES (%s, %s, %s) RETURNING id", (match_type, match_value, note))
+            row = cursor.fetchone()
+            item_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute("INSERT INTO watchlist (match_type, match_value, note) VALUES (?, ?, ?)", (match_type, match_value, note))
+            item_id = cursor.lastrowid
+        conn.commit()
+        return item_id
+
+def list_watchlist(db_path=None) -> list:
+    pg = is_postgres(db_path)
+    items = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, match_type, match_value, note FROM watchlist ORDER BY id ASC", (), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                items.append({
+                    "id": row["id"],
+                    "match_type": row["match_type"],
+                    "match_value": row["match_value"],
+                    "note": row.get("note", "")
+                })
+            else:
+                items.append({
+                    "id": row[0],
+                    "match_type": row[1],
+                    "match_value": row[2],
+                    "note": row[3] or ""
+                })
+    return items
+
+def remove_watchlist_item(item_id: int, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "DELETE FROM watchlist WHERE id = ?", (item_id,), is_pg=pg)
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
+
+def match_watchlist(email_item: dict, db_path=None) -> list:
+    """
+    Check if an email matches any watchlist rule.
+    Returns a list of matched rule dicts with 'reason'.
+    """
+    rules = list_watchlist(db_path=db_path)
+    if not rules:
+        return []
+
+    sender = (email_item.get("sender") or "").strip()
+    subject = (email_item.get("subject") or "").strip()
+    body = (email_item.get("body") or email_item.get("snippet") or "").strip()
+
+    from policy_engine import extract_email_address
+    sender_addr = extract_email_address(sender)
+
+    matches = []
+    for r in rules:
+        mtype = r["match_type"]
+        mval = r["match_value"].strip()
+        matched = False
+        reason = ""
+
+        if mtype == "sender":
+            if mval.lower() == sender_addr or mval.lower() in sender.lower():
+                matched = True
+                reason = f"matched watchlist sender '{mval}'"
+        elif mtype == "domain":
+            clean_dom = mval.lower().lstrip("@")
+            if f"@{clean_dom}" in sender.lower() or sender_addr.endswith(f"@{clean_dom}") or sender_addr.endswith(f".{clean_dom}"):
+                matched = True
+                reason = f"matched watchlist domain '{mval}'"
+        elif mtype == "keyword":
+            mval_lower = mval.lower()
+            if mval_lower in subject.lower() or mval_lower in body.lower():
+                matched = True
+                reason = f"matched watchlist keyword '{mval}'"
+        elif mtype == "regex":
+            import re
+            try:
+                pattern = re.compile(mval, re.IGNORECASE)
+                if pattern.search(subject) or pattern.search(sender) or pattern.search(body):
+                    matched = True
+                    reason = f"matched watchlist regex '{mval}'"
+            except re.error:
+                logger.warning(f"Invalid regex in watchlist rule {r['id']}: {mval}")
+
+        if matched:
+            matches.append({
+                "rule_id": r["id"],
+                "match_type": mtype,
+                "match_value": mval,
+                "reason": reason
+            })
+
+    return matches
+
+# ==================== ALERTS ====================
+def record_alert(email_uid: str, alert_reason: str, sent_at: str = None, acknowledged: int = 0, db_path=None) -> int:
+    pg = is_postgres(db_path)
+    sent_at = sent_at or datetime.now().isoformat()
+    clean_uid = str(email_uid).lstrip("#").strip()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute(
+                "INSERT INTO alerts (email_uid, alert_reason, sent_at, acknowledged) VALUES (%s, %s, %s, %s) RETURNING id",
+                (clean_uid, alert_reason, sent_at, acknowledged)
+            )
+            row = cursor.fetchone()
+            alert_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute(
+                "INSERT INTO alerts (email_uid, alert_reason, sent_at, acknowledged) VALUES (?, ?, ?, ?)",
+                (clean_uid, alert_reason, sent_at, acknowledged)
+            )
+            alert_id = cursor.lastrowid
+        conn.commit()
+        return alert_id
+
+def has_alerted_for_email(email_uid: str, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    clean_uid = str(email_uid).lstrip("#").strip()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT 1 FROM alerts WHERE email_uid = ? LIMIT 1", (clean_uid,), is_pg=pg)
+        return cursor.fetchone() is not None
+
+def count_alerts_in_last_hour(db_path=None) -> int:
+    pg = is_postgres(db_path)
+    from datetime import timedelta
+    one_hour_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT COUNT(*) FROM alerts WHERE sent_at >= ?", (one_hour_ago,), is_pg=pg)
+        row = cursor.fetchone()
+        if isinstance(row, dict) or pg:
+            return list(row.values())[0] if isinstance(row, dict) else row[0]
+        return row[0] if row else 0
+
+def get_latest_alert(db_path=None) -> dict | None:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, email_uid, alert_reason, sent_at, acknowledged FROM alerts ORDER BY id DESC LIMIT 1", (), is_pg=pg)
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if isinstance(row, dict) or pg:
+            return {"id": row["id"], "email_uid": row["email_uid"], "alert_reason": row["alert_reason"], "sent_at": row["sent_at"], "acknowledged": row["acknowledged"]}
+        return {"id": row[0], "email_uid": row[1], "alert_reason": row[2], "sent_at": row[3], "acknowledged": row[4]}
+
+def acknowledge_alert(email_uid: str, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    clean_uid = str(email_uid).lstrip("#").strip()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "UPDATE alerts SET acknowledged = 1 WHERE email_uid = ?", (clean_uid,), is_pg=pg)
+        updated = cursor.rowcount > 0
+        conn.commit()
+        return updated
+
+# ==================== FOLLOWUPS ====================
+def create_followup(email_uid: str, sender: str, subject: str, direction: str = "waiting_on_them", expected_by: str = None, status: str = "open", db_path=None) -> int:
+    pg = is_postgres(db_path)
+    from datetime import timedelta
+    clean_uid = str(email_uid).lstrip("#").strip()
+    created_at = datetime.now().isoformat()
+    if not expected_by:
+        days = getattr(config, "FOLLOWUP_DAYS", 2)
+        expected_by = (datetime.now() + timedelta(days=days)).isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute(
+                "INSERT INTO followups (email_uid, sender, subject, direction, expected_by, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (clean_uid, sender or "", subject or "", direction, expected_by, status, created_at)
+            )
+            row = cursor.fetchone()
+            f_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute(
+                "INSERT INTO followups (email_uid, sender, subject, direction, expected_by, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (clean_uid, sender or "", subject or "", direction, expected_by, status, created_at)
+            )
+            f_id = cursor.lastrowid
+        conn.commit()
+        return f_id
+
+def list_open_followups(db_path=None) -> list:
+    pg = is_postgres(db_path)
+    items = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, email_uid, sender, subject, direction, expected_by, status, created_at FROM followups WHERE status = 'open' ORDER BY expected_by ASC", (), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                items.append({
+                    "id": row["id"],
+                    "email_uid": row["email_uid"],
+                    "sender": row["sender"],
+                    "subject": row["subject"],
+                    "direction": row["direction"],
+                    "expected_by": row["expected_by"],
+                    "status": row["status"],
+                    "created_at": row["created_at"]
+                })
+            else:
+                items.append({
+                    "id": row[0],
+                    "email_uid": row[1],
+                    "sender": row[2],
+                    "subject": row[3],
+                    "direction": row[4],
+                    "expected_by": row[5],
+                    "status": row[6],
+                    "created_at": row[7]
+                })
+    return items
+
+def get_overdue_followups(now_dt: datetime = None, db_path=None) -> list:
+    now_str = (now_dt or datetime.now()).isoformat()
+    pg = is_postgres(db_path)
+    items = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, email_uid, sender, subject, direction, expected_by, status, created_at FROM followups WHERE status = 'open' AND expected_by <= ? ORDER BY expected_by ASC", (now_str,), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                items.append({
+                    "id": row["id"],
+                    "email_uid": row["email_uid"],
+                    "sender": row["sender"],
+                    "subject": row["subject"],
+                    "direction": row["direction"],
+                    "expected_by": row["expected_by"],
+                    "status": row["status"],
+                    "created_at": row["created_at"]
+                })
+            else:
+                items.append({
+                    "id": row[0],
+                    "email_uid": row[1],
+                    "sender": row[2],
+                    "subject": row[3],
+                    "direction": row[4],
+                    "expected_by": row[5],
+                    "status": row[6],
+                    "created_at": row[7]
+                })
+    return items
+
+def close_followup(followup_id: int, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "UPDATE followups SET status = 'closed' WHERE id = ?", (followup_id,), is_pg=pg)
+        updated = cursor.rowcount > 0
+        conn.commit()
+        return updated
+
+def close_matching_followups(email_item: dict, db_path=None) -> list:
+    open_items = [f for f in list_open_followups(db_path=db_path) if f["direction"] == "waiting_on_them"]
+    if not open_items:
+        return []
+
+    import re
+    from policy_engine import extract_email_address
+    incoming_sender = extract_email_address(email_item.get("sender", ""))
+    incoming_subject = (email_item.get("subject") or "").strip().lower()
+    norm_in_subj = re.sub(r'^(?:re:\s*|fwd:\s*)+', '', incoming_subject).strip()
+    refs = str(email_item.get("references") or "") + " " + str(email_item.get("in_reply_to") or "")
+
+    closed_ids = []
+    for f in open_items:
+        f_sender = extract_email_address(f["sender"])
+        f_subj = (f["subject"] or "").strip().lower()
+        norm_f_subj = re.sub(r'^(?:re:\s*|fwd:\s*)+', '', f_subj).strip()
+        f_uid = str(f["email_uid"]).strip()
+
+        matched = False
+        if f_uid and f_uid in refs:
+            matched = True
+        elif f_sender and incoming_sender and f_sender == incoming_sender:
+            if norm_in_subj and norm_f_subj and (norm_in_subj == norm_f_subj or norm_in_subj in norm_f_subj or norm_f_subj in norm_in_subj):
+                matched = True
+        elif norm_in_subj and norm_f_subj and norm_in_subj == norm_f_subj:
+            matched = True
+
+        if matched:
+            close_followup(f["id"], db_path=db_path)
+            closed_ids.append(f["id"])
+
+    return closed_ids
+
+# ==================== SNOOZES ====================
+def create_snooze(email_uid: str, wake_at: str, db_path=None) -> int:
+    pg = is_postgres(db_path)
+    clean_uid = str(email_uid).lstrip("#").strip()
+    created_at = datetime.now().isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute(
+                "INSERT INTO snoozes (email_uid, wake_at, created_at, status) VALUES (%s, %s, %s, 'pending') RETURNING id",
+                (clean_uid, wake_at, created_at)
+            )
+            row = cursor.fetchone()
+            s_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute(
+                "INSERT INTO snoozes (email_uid, wake_at, created_at, status) VALUES (?, ?, ?, 'pending')",
+                (clean_uid, wake_at, created_at)
+            )
+            s_id = cursor.lastrowid
+        conn.commit()
+        return s_id
+
+def get_due_snoozes(now_dt: datetime = None, db_path=None, base_time=None) -> list:
+    target_dt = base_time or now_dt or datetime.now()
+    now_str = target_dt.isoformat() if isinstance(target_dt, datetime) else str(target_dt)
+    pg = is_postgres(db_path)
+    items = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, email_uid, wake_at, created_at, status FROM snoozes WHERE status = 'pending' AND wake_at <= ? ORDER BY wake_at ASC", (now_str,), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                items.append({
+                    "id": row["id"],
+                    "email_uid": row["email_uid"],
+                    "wake_at": row["wake_at"],
+                    "created_at": row["created_at"],
+                    "status": row["status"]
+                })
+            else:
+                items.append({
+                    "id": row[0],
+                    "email_uid": row[1],
+                    "wake_at": row[2],
+                    "created_at": row[3],
+                    "status": row[4]
+                })
+    return items
+
+def mark_snooze_fired(snooze_id: int, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "UPDATE snoozes SET status = 'fired' WHERE id = ?", (snooze_id,), is_pg=pg)
+        updated = cursor.rowcount > 0
+        conn.commit()
+        return updated
+
+# ==================== CONVERSATIONS & MEMORY ====================
+def log_conversation(role: str, content: str, context_tag: str = "telegram", created_at: str = None, db_path=None) -> int:
+    if not getattr(config, "MEMORY_ENABLED", True):
+        return -1
+    pg = is_postgres(db_path)
+    created_at = created_at or datetime.now().isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute(
+                "INSERT INTO conversations (role, content, created_at, context_tag) VALUES (%s, %s, %s, %s) RETURNING id",
+                (role, content, created_at, context_tag)
+            )
+            row = cursor.fetchone()
+            c_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute(
+                "INSERT INTO conversations (role, content, created_at, context_tag) VALUES (?, ?, ?, ?)",
+                (role, content, created_at, context_tag)
+            )
+            c_id = cursor.lastrowid
+        conn.commit()
+        return c_id
+
+def get_recent_conversations(limit: int = 20, db_path=None) -> list:
+    pg = is_postgres(db_path)
+    turns = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, role, content, created_at, context_tag FROM conversations ORDER BY id DESC LIMIT ?", (limit,), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                turns.append({
+                    "id": row["id"],
+                    "role": row["role"],
+                    "content": row["content"],
+                    "created_at": row["created_at"],
+                    "context_tag": row.get("context_tag")
+                })
+            else:
+                turns.append({
+                    "id": row[0],
+                    "role": row[1],
+                    "content": row[2],
+                    "created_at": row[3],
+                    "context_tag": row[4]
+                })
+    turns.reverse()
+    return turns
+
+def set_memory(key: str, value: str, conversation_id: int = None, db_path=None) -> int:
+    if not getattr(config, "MEMORY_ENABLED", True):
+        return -1
+    pg = is_postgres(db_path)
+    updated_at = datetime.now().isoformat()
+    key_clean = key.strip().lower()
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if pg:
+            cursor.execute(
+                """
+                INSERT INTO memory (key, value, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING id
+                """,
+                (key_clean, value.strip(), updated_at)
+            )
+            row = cursor.fetchone()
+            mem_id = row["id"] if isinstance(row, dict) else row[0]
+        else:
+            cursor.execute(
+                """
+                INSERT INTO memory (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key_clean, value.strip(), updated_at)
+            )
+            cursor.execute("SELECT id FROM memory WHERE key = ?", (key_clean,))
+            row = cursor.fetchone()
+            mem_id = row[0] if row else cursor.lastrowid
+
+        if conversation_id is not None:
+            if pg:
+                cursor.execute(
+                    "INSERT INTO memory_refs (memory_id, conversation_id) VALUES (%s, %s)",
+                    (str(mem_id), conversation_id)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO memory_refs (memory_id, conversation_id) VALUES (?, ?)",
+                    (str(mem_id), conversation_id)
+                )
+
+        conn.commit()
+        return mem_id
+
+def get_all_memories(db_path=None) -> list:
+    pg = is_postgres(db_path)
+    memories = []
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        _exec(cursor, "SELECT id, key, value, updated_at FROM memory ORDER BY id ASC", (), is_pg=pg)
+        for row in cursor.fetchall():
+            if isinstance(row, dict) or pg:
+                memories.append({
+                    "id": row["id"],
+                    "key": row["key"],
+                    "value": row["value"],
+                    "updated_at": row["updated_at"]
+                })
+            else:
+                memories.append({
+                    "id": row[0],
+                    "key": row[1],
+                    "value": row[2],
+                    "updated_at": row[3]
+                })
+    return memories
+
+def get_memory(key_or_id, db_path=None) -> dict | None:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if isinstance(key_or_id, int) or (isinstance(key_or_id, str) and key_or_id.isdigit()):
+            _exec(cursor, "SELECT id, key, value, updated_at FROM memory WHERE id = ?", (int(key_or_id),), is_pg=pg)
+        else:
+            _exec(cursor, "SELECT id, key, value, updated_at FROM memory WHERE key = ?", (str(key_or_id).strip().lower(),), is_pg=pg)
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if isinstance(row, dict) or pg:
+            return {"id": row["id"], "key": row["key"], "value": row["value"], "updated_at": row["updated_at"]}
+        return {"id": row[0], "key": row[1], "value": row[2], "updated_at": row[3]}
+
+def delete_memory(key_or_id, db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        if isinstance(key_or_id, int) or (isinstance(key_or_id, str) and key_or_id.isdigit()):
+            _exec(cursor, "DELETE FROM memory WHERE id = ?", (int(key_or_id),), is_pg=pg)
+        else:
+            _exec(cursor, "DELETE FROM memory WHERE key = ?", (str(key_or_id).strip().lower(),), is_pg=pg)
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
+
+def wipe_all_memory(db_path=None) -> bool:
+    pg = is_postgres(db_path)
+    with get_db_connection(db_path) as conn:
+        cursor = _get_cursor(conn, pg)
+        cursor.execute("DELETE FROM memory_refs")
+        cursor.execute("DELETE FROM memory")
+        cursor.execute("DELETE FROM conversations")
+        conn.commit()
+        return True
+
+def get_relevant_memories(query: str = "", limit: int = 8, max_tokens: int = 500, db_path=None) -> list:
+    if not getattr(config, "MEMORY_ENABLED", True):
+        return []
+    all_mems = get_all_memories(db_path=db_path)
+    if not all_mems:
+        return []
+
+    import re
+    if not query:
+        sorted_mems = sorted(all_mems, key=lambda m: m["id"], reverse=True)
+    else:
+        query_words = set(re.findall(r'\w+', query.lower()))
+        def score_mem(m):
+            text = f"{m['key']} {m['value']}".lower()
+            mem_words = set(re.findall(r'\w+', text))
+            overlap = len(query_words.intersection(mem_words))
+            return (overlap, m["id"])
+
+        sorted_mems = sorted(all_mems, key=score_mem, reverse=True)
+
+    selected = []
+    current_tokens = 0
+    for m in sorted_mems[:limit]:
+        approx_tokens = max(1, len(f"{m['key']}: {m['value']}") // 4)
+        if current_tokens + approx_tokens > max_tokens and selected:
+            break
+        selected.append(m)
+        current_tokens += approx_tokens
+
+    return selected
 
 def check_db_health(db_path=None) -> bool:
     try:

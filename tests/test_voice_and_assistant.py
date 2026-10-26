@@ -66,6 +66,7 @@ def test_webhook_receives_voice_note():
         }
         with patch("webhook.download_telegram_file", return_value=b"fake_audio_bytes") as mock_dl, \
              patch("voice_engine.transcribe_audio", return_value="What is my name?") as mock_trans, \
+             patch("webhook.parse_user_command", return_value={"intent": "conversational", "response": "Your name is Adebayo."}) as mock_parse, \
              patch("webhook.send_telegram_message") as mock_send_msg, \
              patch("webhook.send_reply") as mock_reply:
              

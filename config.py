@@ -44,5 +44,14 @@ DATA_DIR = os.getenv("MAILPILOT_DATA_DIR", os.path.join(BASE_DIR, "data"))
 DB_PATH = os.getenv("MAILPILOT_DB_PATH", os.path.join(DATA_DIR, "mailpilot.db"))
 LOG_PATH = os.getenv("MAILPILOT_LOG_PATH", os.path.join(DATA_DIR, "mailpilot.log"))
 
+# Proactive Monitoring & Follow-up Settings (48-hour proactive tracking)
+FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "2"))
+ALERTS_PER_HOUR_MAX = int(os.getenv("ALERTS_PER_HOUR_MAX", "5"))
+
+# Conversational Memory Settings
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() in ("true", "1", "yes")
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "500"))
+MEMORY_INCLUDES_EMAILS = os.getenv("MEMORY_INCLUDES_EMAILS", "false").lower() in ("true", "1", "yes")
+
 # Deprecated
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")

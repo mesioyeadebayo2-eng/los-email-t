@@ -137,6 +137,16 @@ def apply_policy_actions(processed_emails: list, dry_run: bool = False, db_path=
                     status="auto_sent",
                     db_path=db_path
                 )
+                try:
+                    db.create_followup(
+                        email_uid=email_uid,
+                        sender=sender,
+                        subject=reply_subject,
+                        direction="waiting_on_them",
+                        db_path=db_path
+                    )
+                except Exception as ex_f:
+                    logger.warning(f"Failed creating auto-send followup: {ex_f}")
                 
                 import html
                 # Notify Telegram with the full text sent

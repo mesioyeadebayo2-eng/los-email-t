@@ -174,13 +174,20 @@ def parse_email_message(msg_bytes: bytes, e_id: str) -> dict:
     else:
         body = ""
         
+    message_id = _decode_header_str(msg.get("Message-ID", ""))
+    references = _decode_header_str(msg.get("References", ""))
+    in_reply_to = _decode_header_str(msg.get("In-Reply-To", ""))
+
     return {
         "id": str(e_id),
         "sender": sender,
         "subject": subject,
         "body": body[:3200],  # Truncate body to ~800 tokens roughly
         "date": date,
-        "attachments": attachments
+        "attachments": attachments,
+        "message_id": message_id,
+        "references": references,
+        "in_reply_to": in_reply_to
     }
 
 def get_unread_emails(dry_run: bool = False, mark_read: bool = False, max_fetch: int = None, filter_processed: bool = True) -> list:

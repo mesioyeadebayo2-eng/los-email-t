@@ -17,10 +17,13 @@ from telegram_client import (
     answer_callback_query,
     send_telegram_voice,
     send_chat_action,
-    download_telegram_file
+    download_telegram_file,
+    send_telegram_document
 )
 import voice_engine
 import attachment_handler
+import time_parser
+import memory_engine
 from scheduler import create_scheduler
 
 logger = logging.getLogger(__name__)
@@ -161,6 +164,10 @@ def process_pending_send_dispatch(chat_id: str, pending_data: dict, voice_reply:
         send_telegram_message(chat_id, f"✉️ <b>Delivering email to client {to_addr}{att_desc}...</b>")
         success = send_email(to_addr, subj, body, attachments=attachments)
         if success:
+            try:
+                db.create_followup(email_uid=to_addr, sender=to_addr, subject=subj, direction="waiting_on_them")
+            except Exception as ex_f:
+                logger.warning(f"Error creating followup: {ex_f}")
             send_reply(
                 chat_id,
                 f"✅ <b>Email delivered successfully to client!</b>\n\n"
@@ -213,6 +220,10 @@ def handle_telegram_callback(cb: dict):
             send_telegram_message(chat_id, f"✉️ <b>Delivering email to client {to_addr}{att_desc}...</b>")
             success = send_email(to_addr, subj, body, attachments=attachments)
             if success:
+                try:
+                    db.create_followup(email_uid=to_addr, sender=to_addr, subject=subj, direction="waiting_on_them")
+                except Exception as ex_f:
+                    logger.warning(f"Error creating followup: {ex_f}")
                 send_telegram_message(chat_id, f"✅ <b>Email delivered successfully to client!</b>\n\n<b>To:</b> <code>{to_addr}</code>\n<b>Subject:</b> {subj}")
             else:
                 send_telegram_message(chat_id, f"❌ Failed to send email to <b>{to_addr}</b> via Gmail SMTP. Check server logs.")
@@ -240,10 +251,40 @@ def handle_telegram_callback(cb: dict):
         else:
             send_telegram_message(chat_id, "✏️ Please type a new command to draft your email.")
 
+    elif action == "mem_forget":
+        target_id = send_id
+        item = db.get_memory(target_id)
+        if item:
+            db.delete_memory(target_id)
+            answer_callback_query(query_id, "Memory forgotten")
+            send_telegram_message(chat_id, f"✅ Memory <b>#{item['id']} [{item['key']}]</b> has been forgotten.")
+        else:
+            answer_callback_query(query_id, "Not found")
+            send_telegram_message(chat_id, "⚠️ Memory not found or already deleted.")
+
+    elif action == "mem_wipe":
+        if send_id == "confirm":
+            db.wipe_all_memory()
+            answer_callback_query(query_id, "All memory wiped")
+            send_telegram_message(chat_id, "✅ <b>Memory wiped!</b> All stored memories and conversation turns have been deleted.")
+        else:
+            answer_callback_query(query_id, "Cancelled")
+            send_telegram_message(chat_id, "❌ Memory wipe cancelled.")
+
+    elif action == "mem_cancel":
+        answer_callback_query(query_id, "Cancelled")
+        send_telegram_message(chat_id, "❌ Action cancelled.")
+
     return jsonify({"status": "ok"}), 200
 
 def send_reply(chat_id: str, text: str, voice_reply: bool = False, spoken_override: str = None):
     """Deliver a text message, and optionally a spoken voice note in Cedar's voice."""
+    if getattr(config, "MEMORY_ENABLED", True):
+        try:
+            db.log_conversation("assistant", text, context_tag="telegram")
+        except Exception as ex:
+            logger.warning(f"Error logging assistant reply: {ex}")
+
     send_telegram_message(chat_id, text)
     if voice_reply:
         send_chat_action(chat_id, "record_voice")
@@ -390,7 +431,49 @@ def handle_telegram_incoming_message(msg: dict):
     if not text_body:
         return jsonify({"status": "ok"}), 200
 
-    # Whitelist & policy management commands
+    # Log user turn for conversational memory
+    if getattr(config, "MEMORY_ENABLED", True):
+        try:
+            db.log_conversation(role="user", content=text_body, context_tag="telegram")
+        except Exception as ex_log:
+            logger.warning(f"Error logging user turn: {ex_log}")
+
+    # Check for natural language snooze / reminder command
+    # e.g. "remind me about this in 2 hours", "tomorrow 9am", "next Monday"
+    snooze_target_time = time_parser.parse_snooze_time(text_body)
+    is_snooze_request = (
+        snooze_target_time is not None and
+        any(w in text_body.lower() for w in ("remind", "snooze", "wake", "alert me"))
+    )
+    if is_snooze_request:
+        email_uid = None
+        reply_to = msg.get("reply_to_message", {})
+        reply_text = reply_to.get("text", "")
+        uid_match = re.search(r'\[#?(\w+)\]|#(\w+)', reply_text)
+        if uid_match:
+            email_uid = uid_match.group(1) or uid_match.group(2)
+        if not email_uid:
+            cmd_uid_match = re.search(r'\[#?(\w+)\]|#(\w+)|email\s+(\w+)', text_body, re.IGNORECASE)
+            if cmd_uid_match:
+                email_uid = cmd_uid_match.group(1) or cmd_uid_match.group(2) or cmd_uid_match.group(3)
+        if not email_uid:
+            latest_al = db.get_latest_alert()
+            if latest_al:
+                email_uid = latest_al["email_uid"]
+
+        if email_uid:
+            db.create_snooze(email_uid, snooze_target_time.isoformat())
+            wake_formatted = snooze_target_time.strftime("%A, %b %d at %I:%M %p")
+            reply = f"⏰ <b>Snooze set!</b> I will remind you about email <b>[#{email_uid}]</b> on <b>{wake_formatted}</b>."
+            send_reply(chat_id, reply, voice_reply=False)
+            if getattr(config, "MEMORY_ENABLED", True):
+                memory_engine.trigger_memory_extraction_async()
+            return jsonify({"status": "ok"}), 200
+        else:
+            send_reply(chat_id, "⏰ Which email would you like me to snooze? (e.g. reply to an alert or include <code>#123</code>)", voice_reply=False)
+            return jsonify({"status": "ok"}), 200
+
+    # Whitelist, Watchlist, Memory, & Policy management commands
     if text_body.startswith("/"):
         parts = text_body.split(maxsplit=1)
         command = parts[0].lower()
@@ -424,6 +507,201 @@ def handle_telegram_incoming_message(msg: dict):
                 send_telegram_message(chat_id, "\n".join(lines))
             else:
                 send_telegram_message(chat_id, "📋 No custom sender policies configured.\nUse <code>/allow email@x.com</code> or <code>/block email@x.com</code>.")
+            return jsonify({"status": "ok"}), 200
+
+        elif command == "/watch":
+            # /watch add <type> <val> [note]
+            # /watch list
+            # /watch remove <id>
+            subparts = arg.split(maxsplit=2)
+            subcmd = subparts[0].lower() if subparts else "list"
+            if subcmd == "add":
+                if len(subparts) < 3:
+                    send_telegram_message(chat_id, "Usage: <code>/watch add &lt;sender|domain|keyword|regex&gt; &lt;value&gt; [note]</code>")
+                else:
+                    mtype = subparts[1].lower()
+                    rest = subparts[2].split(maxsplit=1)
+                    mval = rest[0]
+                    note = rest[1] if len(rest) > 1 else ""
+                    try:
+                        w_id = db.add_watchlist_item(mtype, mval, note=note)
+                        send_telegram_message(chat_id, f"✅ Added watchlist rule #{w_id} (<code>{mtype}</code>: <code>{mval}</code>).")
+                    except Exception as e_w:
+                        send_telegram_message(chat_id, f"❌ Failed to add rule: {e_w}")
+            elif subcmd in ("remove", "rm", "delete"):
+                if len(subparts) < 2:
+                    send_telegram_message(chat_id, "Usage: <code>/watch remove &lt;id&gt;</code>")
+                else:
+                    try:
+                        rule_id = int(subparts[1].lstrip("#"))
+                        removed = db.remove_watchlist_item(rule_id)
+                        if removed:
+                            send_telegram_message(chat_id, f"✅ Removed watchlist rule #{rule_id}.")
+                        else:
+                            send_telegram_message(chat_id, f"⚠️ Watchlist rule #{rule_id} not found.")
+                    except ValueError:
+                        send_telegram_message(chat_id, "⚠️ Invalid rule ID. Must be a number.")
+            else: # list
+                rules = db.list_watchlist()
+                if not rules:
+                    send_telegram_message(chat_id, "📋 Watchlist is empty.\nAdd rules using: <code>/watch add sender ceo@x.com</code> or <code>/watch add keyword invoice</code>")
+                else:
+                    lines = ["📋 <b>Active Watchlist Rules:</b>\n"]
+                    for r in rules:
+                        note_str = f" <i>({r['note']})</i>" if r.get("note") else ""
+                        lines.append(f"• <b>#{r['id']}</b> [<code>{r['match_type']}</code>]: <code>{r['match_value']}</code>{note_str}")
+                    send_telegram_message(chat_id, "\n".join(lines))
+            return jsonify({"status": "ok"}), 200
+
+        elif command == "/followup":
+            # /followup list
+            from datetime import datetime
+            open_f = db.list_open_followups()
+            if not open_f:
+                send_telegram_message(chat_id, "⏰ No open follow-ups. You're all caught up!")
+            else:
+                lines = ["⏰ <b>Open Follow-ups:</b>\n"]
+                for f in open_f:
+                    expected_str = f.get("expected_by", "")
+                    days_overdue = 0
+                    try:
+                        exp_dt = datetime.fromisoformat(expected_str)
+                        diff = datetime.now() - exp_dt
+                        days_overdue = diff.days
+                    except Exception:
+                        pass
+                    if days_overdue > 0:
+                        status_tag = f"🔴 <b>{days_overdue}d overdue</b>"
+                    elif days_overdue == 0:
+                        status_tag = "🟡 <b>due today</b>"
+                    else:
+                        status_tag = f"🟢 due in {abs(days_overdue)}d"
+                    lines.append(f"• <b>#{f['id']}</b> to <code>{f['sender']}</code>\n  <b>Re:</b> {f['subject']} — {status_tag}\n  <i>Re-ask:</i> /reask_{f['id']}")
+                send_telegram_message(chat_id, "\n".join(lines))
+            return jsonify({"status": "ok"}), 200
+
+        elif command.startswith("/reask_"):
+            f_id_str = command.replace("/reask_", "")
+            try:
+                f_id = int(f_id_str)
+                followups = db.list_open_followups()
+                target_f = next((f for f in followups if f["id"] == f_id), None)
+                if not target_f:
+                    send_telegram_message(chat_id, f"⚠️ Follow-up #{f_id} not found or already closed.")
+                else:
+                    to_email = target_f["sender"]
+                    orig_subj = target_f["subject"]
+                    reply_subj = orig_subj if orig_subj.lower().startswith("re:") else f"Re: {orig_subj}"
+                    body = f"Hello,\n\nFollowing up on my previous email regarding '{orig_subj}'. Just wanted to see if you had a chance to review this?\n\nBest regards,"
+                    confirmation_id = db.create_pending_send(to_email, reply_subj, body)
+                    send_send_confirmation(chat_id, confirmation_id, to_email, reply_subj, body)
+            except Exception as e_rf:
+                send_telegram_message(chat_id, f"⚠️ Error preparing follow-up: {e_rf}")
+            return jsonify({"status": "ok"}), 200
+
+        elif command == "/memory":
+            # /memory
+            # /memory add <text>
+            # /memory forget <key-or-number> [confirm]
+            # /memory export
+            # /memory wipe
+            from datetime import datetime
+            subparts = arg.split(maxsplit=1)
+            subcmd = subparts[0].lower() if subparts else ""
+            rest_arg = subparts[1].strip() if len(subparts) > 1 else ""
+
+            if subcmd == "add":
+                if not rest_arg:
+                    send_telegram_message(chat_id, "Usage: <code>/memory add key: value</code> or <code>/memory add I prefer short emails</code>")
+                else:
+                    if ":" in rest_arg:
+                        k, v = rest_arg.split(":", 1)
+                        k = k.strip().lower()
+                        v = v.strip()
+                    else:
+                        import time
+                        k = f"fact_{int(time.time())}"
+                        v = rest_arg.strip()
+                    db.set_memory(k, v)
+                    send_telegram_message(chat_id, f"🧠 <b>Saved to memory:</b> [<code>{k}</code>] {v}")
+            elif subcmd == "forget":
+                if not rest_arg:
+                    send_telegram_message(chat_id, "Usage: <code>/memory forget &lt;key-or-number&gt;</code>")
+                else:
+                    forget_parts = rest_arg.split()
+                    target_key = forget_parts[0]
+                    is_confirmed = len(forget_parts) > 1 and forget_parts[1].lower() in ("confirm", "yes", "true")
+                    item = db.get_memory(target_key)
+                    if not item:
+                        send_telegram_message(chat_id, f"⚠️ Memory <code>{target_key}</code> not found.")
+                    elif is_confirmed:
+                        db.delete_memory(target_key)
+                        send_telegram_message(chat_id, f"✅ Memory <b>#{item['id']} [{item['key']}]</b> has been forgotten.")
+                    else:
+                        keyboard = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "✅ Confirm Forget", "callback_data": f"mem_forget:{item['id']}"},
+                                    {"text": "❌ Cancel", "callback_data": f"mem_cancel:{item['id']}"}
+                                ]
+                            ]
+                        }
+                        send_telegram_message(
+                            chat_id,
+                            f"❓ <b>Are you sure you want to forget this memory?</b>\n\n"
+                            f"<b>#{item['id']} [{item['key']}]:</b> {item['value']}",
+                            reply_markup=keyboard
+                        )
+            elif subcmd == "export":
+                mems = db.get_all_memories()
+                convs = db.get_recent_conversations(limit=100)
+                export_lines = [
+                    "MAILPILOT CONVERSATIONAL MEMORY EXPORT",
+                    f"Generated: {datetime.now().isoformat()}",
+                    "========================================",
+                    "\n[DISTILLED MEMORIES]"
+                ]
+                if mems:
+                    for m in mems:
+                        export_lines.append(f"#{m['id']} [{m['key']}]: {m['value']} (Updated: {m.get('updated_at', '')})")
+                else:
+                    export_lines.append("No memories stored.")
+
+                export_lines.append("\n[RECENT CONVERSATION HISTORY]")
+                if convs:
+                    for c in convs:
+                        export_lines.append(f"[{c.get('created_at', '')}] {c.get('role', 'user').upper()}: {c.get('content', '')}")
+                else:
+                    export_lines.append("No conversations recorded.")
+
+                doc_bytes = "\n".join(export_lines).encode("utf-8")
+                send_telegram_document(chat_id, doc_bytes, "mailpilot_memory_export.txt", caption="🧠 <b>MailPilot Memory Export</b>")
+            elif subcmd == "wipe":
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🚨 Confirm Wipe Everything", "callback_data": "mem_wipe:confirm"},
+                            {"text": "❌ Cancel", "callback_data": "mem_wipe:cancel"}
+                        ]
+                    ]
+                }
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>Warning: Wipe All Memory</b>\n\n"
+                    "Are you sure you want to delete ALL stored memories, conversations, and provenance references?\n"
+                    "This action is permanent and cannot be undone.",
+                    reply_markup=keyboard
+                )
+            else: # list
+                mems = db.get_all_memories()
+                if not mems:
+                    send_telegram_message(chat_id, "🧠 <b>Memory is empty.</b>\nTell me facts about yourself or use <code>/memory add key: value</code>.")
+                else:
+                    lines = ["🧠 <b>Stored Memories:</b>\n"]
+                    for m in mems:
+                        lines.append(f"• <b>#{m['id']} [{m['key']}]:</b> {html.escape(m['value'])}")
+                    lines.append("\n<i>Commands: /memory add &lt;text&gt; | /memory forget &lt;id&gt; | /memory export | /memory wipe</i>")
+                    send_telegram_message(chat_id, "\n".join(lines))
             return jsonify({"status": "ok"}), 200
 
         elif command == "/notes":
@@ -483,6 +761,8 @@ def handle_telegram_incoming_message(msg: dict):
     # Check if user specifically requested a voice reply in text
     voice_requested = any(w in text_body.lower() for w in ["voice note", "in voice", "speak to me", "voice reply", "audio message", "say it"])
     handle_telegram_intent(text_body, chat_id, voice_reply=voice_requested)
+    if getattr(config, "MEMORY_ENABLED", True):
+        memory_engine.trigger_memory_extraction_async()
     return jsonify({"status": "ok"}), 200
 
 def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
@@ -574,13 +854,13 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
                 logger.warning(f"Failed sending email digest to owner: {e_dig}")
 
         if voice_reply:
-            urgent_count = sum(1 for e in processed if e.get("urgency") == "URGENT")
-            user_name = db.get_user_memory("user_name") or "there"
-            spoken = f"Hello {user_name}! I have processed {len(processed)} email{'s' if len(processed) != 1 else ''} for your digest. "
+            urgent_count = sum(1 for e in processed if e.get("urgency") == "URGENT" or "Action" in e.get("triage_bucket", ""))
+            user_name = db.get_user_memory("user_name") or "Principal"
+            spoken = f"Good day, {user_name}. I've triaged {len(processed)} email{'s' if len(processed) != 1 else ''}. "
             if urgent_count > 0:
-                spoken += f"You have {urgent_count} urgent message that needs your attention. "
+                spoken += f"We have {urgent_count} action-required item{'s' if urgent_count != 1 else ''} needing your attention. "
             top_emails = [e.get('subject', 'Untitled') for e in processed[:3]]
-            spoken += "Top topics include: " + ", ".join(top_emails) + ". Check the cards above for full details."
+            spoken += "Key items include: " + ", ".join(top_emails) + ". Details are ready in your brief."
             audio = voice_engine.generate_speech(spoken, voice="cedar")
             if audio:
                 send_telegram_voice(chat_id, audio)
@@ -657,6 +937,10 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
             if success:
                 confirmation_id = db.create_pending_send(to_email, subject, body)
                 db.confirm_pending_send(confirmation_id)
+                try:
+                    db.create_followup(email_uid=to_email, sender=to_email, subject=subject, direction="waiting_on_them")
+                except Exception as ex_f:
+                    logger.warning(f"Failed creating followup: {ex_f}")
                 send_reply(
                     chat_id,
                     f"✅ <b>Email delivered successfully to client!</b>\n\n<b>To:</b> <code>{to_email}</code>\n<b>Subject:</b> {subject}",
@@ -681,8 +965,8 @@ def handle_telegram_intent(cmd: str, chat_id: str, voice_reply: bool = False):
                 send_telegram_voice(chat_id, audio)
 
     else:
-        # Conversational / general query / personal assistant response
-        reply = intent_data.get("response", "I am Cedar, your personal executive assistant. How can I assist you today?")
+        # Conversational / unknown intent path using retrieved memories + last 20 turns
+        reply = memory_engine.answer_conversational_turn(cmd)
         send_reply(chat_id, reply, voice_reply)
 
 if __name__ == "__main__":

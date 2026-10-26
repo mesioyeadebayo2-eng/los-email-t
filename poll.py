@@ -13,7 +13,9 @@ import socket
 logger = logging.getLogger(__name__)
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+else:
+    sys.stdout.reconfigure(line_buffering=True)
 
 _instance_socket = None
 

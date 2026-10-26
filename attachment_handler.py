@@ -106,9 +106,12 @@ def extract_document_text(file_bytes: bytes, filename: str) -> str:
                 return file_bytes.decode(encoding).strip()
             except UnicodeDecodeError:
                 continue
-        return "(Could not decode text file with standard encodings.)"
-        
-    return f"Attachment '{filename}' is a binary file ({len(file_bytes)} bytes)."
+    # Binary or unsupported file
+    import uuid
+    from datetime import datetime
+    corr_id = f"cedar-fb-att-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}"
+    logger.warning(f"[CEDAR_FALLBACK] correlation_id={corr_id} state='UNSUPPORTED_ATTACHMENT' file='{filename}' ext='{ext}' bytes={len(file_bytes)}")
+    return f"Attachment '{filename}' is a binary file ({len(file_bytes)} bytes). [State: UNSUPPORTED_ATTACHMENT | Correlation ID: {corr_id}]"
 
 def summarize_document(text: str, filename: str, user_instruction: str = None) -> str:
     """
@@ -147,5 +150,8 @@ def summarize_document(text: str, filename: str, user_instruction: str = None) -
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Error summarizing document: {e}")
-        return f"Error analyzing document: {e}"
+        import uuid
+        from datetime import datetime
+        corr_id = f"cedar-fb-doc-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}"
+        logger.error(f"[CEDAR_FALLBACK] correlation_id={corr_id} state='OUTAGE_OR_RATE_LIMIT' error='{e}'")
+        return f"Error analyzing document: {e} [State: OUTAGE_OR_RATE_LIMIT | Correlation ID: {corr_id}]"

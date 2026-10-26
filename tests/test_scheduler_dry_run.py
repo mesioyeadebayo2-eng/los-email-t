@@ -13,6 +13,8 @@ def temp_db(monkeypatch):
     temp_db_path = os.path.join(temp_dir, "test_scheduler.db")
     db.init_db(temp_db_path)
     monkeypatch.setattr(config, "DB_PATH", temp_db_path)
+    monkeypatch.setattr(config, "TELEGRAM_CHAT_ID", "")
+    monkeypatch.setattr("voice_engine.generate_speech", lambda *a, **k: None)
     yield temp_db_path
     gc.collect()
     try:

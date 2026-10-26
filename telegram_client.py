@@ -58,6 +58,19 @@ def send_telegram_alert(error_message: str) -> bool:
         
     return send_telegram_message(config.TELEGRAM_CHAT_ID, alert_text)
 
+_last_memory_error_alert_time = 0
+
+def send_memory_error_alert(error_message: str) -> bool:
+    """Send memory error alert to Telegram, rate-limited to at most 1 alert per hour."""
+    global _last_memory_error_alert_time
+    now = time.time()
+    if now - _last_memory_error_alert_time < 3600:
+        logger.warning(f"Memory error alert suppressed due to rate-limiting: {error_message}")
+        return False
+    _last_memory_error_alert_time = now
+    return send_telegram_alert(f"[Memory System] {error_message}")
+
+
 def answer_callback_query(callback_query_id: str, text: str = None) -> bool:
     """Acknowledge Telegram callback query from button clicks."""
     if not config.TELEGRAM_BOT_TOKEN:
@@ -111,39 +124,74 @@ def send_send_confirmation(chat_id: str, confirmation_id: str, to_address: str, 
     }
     return send_telegram_message(chat_id, message_body, reply_markup=keyboard)
 
-def format_telegram_digest(emails: list) -> str:
-    if not emails:
+def format_telegram_digest(emails: list, due_followups: list = None) -> str:
+    if not emails and not due_followups:
         return "📬 <b>MailPilot Digest</b>\nNo new emails today!"
 
     lines = ["📬 <b>MailPilot Digest</b>\n"]
-    for e in emails:
-        urgency = e.get("urgency", "NORMAL")
-        emoji = "🔴" if urgency == "URGENT" else "🟡" if urgency == "NORMAL" else "⚪"
-        cat = html.escape(str(e.get("category", "Unknown")), quote=False)
-        draft_status = "✍️ Draft ready" if e.get("draft_reply") else "🚫 No draft"
+    if emails:
+        for e in emails:
+            urgency = e.get("urgency", "NORMAL")
+            triage = e.get("triage_bucket", "")
+            if "Action" in triage or urgency == "URGENT":
+                emoji = "🔴"
+            elif "Noise" in triage or "Newsletter" in triage or urgency == "LOW":
+                emoji = "🟢"
+            else:
+                emoji = "🟡"
 
-        safe_id = html.escape(str(e.get("id", "")), quote=False)
-        safe_sender = html.escape(str(e.get("sender", "")), quote=False)
-        safe_subject = html.escape(str(e.get("subject", "")), quote=False)
-        safe_summary = html.escape(str(e.get("summary", "")), quote=False)
+            cat = html.escape(str(e.get("category", "Unknown")), quote=False)
+            triage_desc = f" ({html.escape(triage, quote=False)})" if triage else ""
+            draft_status = "✍️ Draft ready" if e.get("draft_reply") else "🚫 No draft"
 
-        block = f"{emoji} <b>[{safe_id}] {safe_sender}</b>\n"
-        block += f"<b>Subject:</b> {safe_subject}\n"
-        block += f"<b>Cat:</b> {cat} | {draft_status}\n"
-        
-        attachments = e.get("attachments", [])
-        if attachments:
-            safe_attachments = html.escape(", ".join(str(a) for a in attachments), quote=False)
-            block += f"<b>Attachments:</b> {safe_attachments}\n"
+            safe_id = html.escape(str(e.get("id", "")), quote=False)
+            safe_sender = html.escape(str(e.get("sender", "")), quote=False)
+            safe_subject = html.escape(str(e.get("subject", "")), quote=False)
+            safe_summary = html.escape(str(e.get("summary", "")), quote=False)
+
+            block = f"{emoji} <b>[{safe_id}] {safe_sender}</b>\n"
+            block += f"<b>Subject:</b> {safe_subject}\n"
+            block += f"<b>Cat:</b> {cat}{triage_desc} | {draft_status}\n"
             
-        block += f"<b>Summary:</b> {safe_summary}"
-        
-        # Limit to 4096 chars for Telegram limits
-        if len("\n\n".join(lines) + "\n\n" + block) > 4000:
-            lines.append("\n<i>...truncated due to length...</i>")
-            break
+            attachments = e.get("attachments", [])
+            if attachments:
+                safe_attachments = html.escape(", ".join(str(a) for a in attachments), quote=False)
+                block += f"<b>Attachments:</b> {safe_attachments}\n"
+                
+            block += f"<b>Summary:</b> {safe_summary}"
+
+            # Format AURA correlation task if extracted
+            aura_task = e.get("aura_task")
+            if aura_task and isinstance(aura_task, dict) and aura_task.get("task_title"):
+                task_t = html.escape(str(aura_task.get("task_title", "")), quote=False)
+                due_d = html.escape(str(aura_task.get("due_date") or "Unspecified"), quote=False)
+                prio_d = html.escape(str(aura_task.get("priority") or "MEDIUM"), quote=False)
+                block += f"\n📌 <b>AURA Task:</b> {task_t} (Due: {due_d} | Priority: {prio_d})"
             
-        lines.append(block)
+            # Limit to 4096 chars for Telegram limits
+            if len("\n\n".join(lines) + "\n\n" + block) > 4000:
+                lines.append("\n<i>...truncated due to length...</i>")
+                break
+                
+            lines.append(block)
+
+    if due_followups:
+        from datetime import datetime
+        lines.append("⏰ <b>Follow-ups due:</b>")
+        for f in due_followups:
+            safe_s = html.escape(str(f.get("sender", "")), quote=False)
+            safe_sub = html.escape(str(f.get("subject", "")), quote=False)
+            f_id = f.get("id")
+            expected_str = f.get("expected_by", "")
+            days_overdue = 0
+            try:
+                exp_dt = datetime.fromisoformat(expected_str)
+                diff = datetime.now() - exp_dt
+                days_overdue = max(0, diff.days)
+            except Exception:
+                pass
+            overdue_tag = f" ({days_overdue}d overdue)" if days_overdue > 0 else " (due today)"
+            lines.append(f"• <b>To:</b> {safe_s} | <b>Subject:</b> {safe_sub}{overdue_tag}\n  👉 One tap to re-ask: /reask_{f_id}")
 
     return "\n\n".join(lines)
 
@@ -199,5 +247,28 @@ def send_telegram_voice(chat_id: str, audio_bytes: bytes, caption: str = None) -
                 time.sleep(1)
                 continue
             logger.error(f"Error sending Telegram voice note: {e}")
+            return False
+    return False
+
+def send_telegram_document(chat_id: str, document_bytes: bytes, filename: str, caption: str = None) -> bool:
+    """Send a document (e.g. .txt memory export) to Telegram via sendDocument."""
+    if not config.TELEGRAM_BOT_TOKEN or not document_bytes:
+        return False
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendDocument"
+    files = {"document": (filename, document_bytes, "text/plain")}
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+
+    for attempt in range(2):
+        try:
+            res = requests.post(url, data=data, files=files, timeout=(15, 45))
+            res.raise_for_status()
+            return True
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            logger.error(f"Error sending Telegram document: {e}")
             return False
     return False

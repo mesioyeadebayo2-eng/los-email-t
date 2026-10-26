@@ -131,6 +131,8 @@ def test_webhook_photo_analysis():
         }
         with patch("webhook.download_telegram_file", return_value=b"photo_bytes") as mock_dl, \
              patch("attachment_handler.analyze_image", return_value="The whiteboard says Launch Monday.") as mock_vis, \
+             patch("webhook.send_chat_action"), \
+             patch("webhook.send_telegram_message"), \
              patch("webhook.send_reply") as mock_reply:
 
             resp = handle_telegram_incoming_message(photo_msg)
